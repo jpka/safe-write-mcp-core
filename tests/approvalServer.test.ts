@@ -245,6 +245,30 @@ describe("approval server: request-provenance hardening", () => {
     expect((JSON.parse(result.body) as { code: string }).code).toBe("FORBIDDEN");
   });
 
+  it("accepts localhost as a Host header name on the bound port", async () => {
+    const result = await rawRequest(`${baseUrl}/api/plans`, {
+      method: "GET",
+      headers: { Host: `localhost:${approval.port}` },
+    });
+    expect(result.status).toBe(200);
+  });
+
+  it("accepts localhost as a Host name with a matching Origin", async () => {
+    const result = await rawRequest(`${baseUrl}/api/plans`, {
+      method: "GET",
+      headers: { Host: `localhost:${approval.port}`, Origin: `http://localhost:${approval.port}` },
+    });
+    expect(result.status).toBe(200);
+  });
+
+  it("still rejects a loopback Host name on the wrong port", async () => {
+    const result = await rawRequest(`${baseUrl}/api/plans`, {
+      method: "GET",
+      headers: { Host: "localhost:1" },
+    });
+    expect(result.status).toBe(403);
+  });
+
   it("rejects an Origin header that doesn't match this server's origin", async () => {
     const resp = await fetch(`${baseUrl}/api/plans`, { headers: { Origin: "http://evil.example.com" } });
     expect(resp.status).toBe(403);
@@ -276,6 +300,20 @@ describe("approval server: request-provenance hardening", () => {
     });
     expect(result.status).toBe(415);
     expect((JSON.parse(result.body) as { code: string }).code).toBe("UNSUPPORTED_MEDIA_TYPE");
+  });
+
+  it("rejects an oversized request body with 413, not 500", async () => {
+    const token = createGatedPlan(store, "oversized-body-check");
+    const oversized = JSON.stringify({ approvedBy: "x".repeat(70 * 1024) });
+    const result = await rawRequest(`${baseUrl}/api/plans/${encodeURIComponent(token)}/approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: oversized,
+    });
+    expect(result.status).toBe(413);
+    const parsed = JSON.parse(result.body) as { code: string; message: string };
+    expect(parsed.code).toBe("PAYLOAD_TOO_LARGE");
+    expect(parsed.message).not.toContain("x".repeat(10));
   });
 
   it("still serves a legitimate request whose Origin matches the server's own origin", async () => {

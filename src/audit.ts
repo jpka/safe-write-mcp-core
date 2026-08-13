@@ -32,16 +32,22 @@ export interface AuditEvent {
 
 /**
  * A host's audit persistence contract: `record()` must never throw and must
- * return synchronously. Hosts needing async persistence (a database write)
- * should enqueue inside `record()` and flush out-of-band. The core wraps
- * every call in a try/catch as defense-in-depth, but a sink that throws is
- * a sink bug, not something the core works around silently.
+ * return synchronously. The declared `undefined` return type rejects async
+ * implementations at compile time — a rejected promise would bypass the
+ * core's try/catch and become an unhandled rejection. Hosts needing async
+ * persistence (a database write) should enqueue inside `record()` and flush
+ * out-of-band. The core wraps every call in a try/catch and attaches a
+ * rejection handler to any thenable it detects, as defense-in-depth — but a
+ * sink that throws or rejects is a sink bug, not something the core works
+ * around silently.
  */
 export interface AuditSink {
-  record(event: AuditEvent): void;
+  record(event: AuditEvent): undefined;
 }
 
 /** Default sink: drops everything. Used when no host audit persistence is configured. */
 export const NoopSink: AuditSink = {
-  record() {},
+  record() {
+    return undefined;
+  },
 };

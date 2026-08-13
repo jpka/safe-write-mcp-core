@@ -38,6 +38,60 @@ describe("fingerprint", () => {
   it("ignores undefined values", () => {
     expect(fingerprint({ a: undefined, b: 1 })).toBe(fingerprint({ b: 1 }));
   });
+
+  it("honors toJSON (e.g. Date) instead of collapsing to {}", () => {
+    expect(fingerprint(new Date(1_700_000_000_000))).toBe(fingerprint(new Date(1_700_000_000_000)));
+    expect(fingerprint(new Date(1_700_000_000_000))).not.toBe(fingerprint(new Date(1_700_000_000_001)));
+    expect(fingerprint(new Date(1_700_000_000_000))).not.toBe(fingerprint({}));
+  });
+
+  it("calls toJSON with the enclosing JSON key", () => {
+    const keySensitive = {
+      value: {
+        toJSON(key: string) {
+          return key === "value" ? "nested-key" : "other-key";
+        },
+      },
+    };
+    expect(fingerprint(keySensitive)).toBe(fingerprint({ value: "nested-key" }));
+  });
+
+  it("omits object members whose toJSON returns undefined, like JSON.stringify", () => {
+    const member = { a: { toJSON: () => undefined }, b: 1 };
+    expect(fingerprint(member)).toBe(fingerprint({ b: 1 }));
+    expect(fingerprint(member)).not.toBe(fingerprint({ a: null, b: 1 }));
+  });
+
+  it("rejects cyclic payloads with a deliberate error, not a RangeError", () => {
+    const cyclicObject: Record<string, unknown> = {};
+    cyclicObject.self = cyclicObject;
+    expect(() => fingerprint(cyclicObject)).toThrow(TypeError);
+
+    const cyclicArray: unknown[] = [];
+    cyclicArray.push(cyclicArray);
+    expect(() => fingerprint(cyclicArray)).toThrow(TypeError);
+  });
+
+  it("keeps distinct fingerprints for [undefined], [null], holes, and []", () => {
+    const holey: unknown[] = [];
+    holey.length = 1; // [ <1 empty item> ]
+    expect(fingerprint([undefined])).toBe(fingerprint([null]));
+    expect(fingerprint([undefined])).not.toBe(fingerprint([]));
+    expect(fingerprint(holey)).toBe(fingerprint([undefined]));
+    expect(fingerprint(holey)).not.toBe(fingerprint([]));
+  });
+
+  it("does not crash on a top-level undefined payload", () => {
+    expect(fingerprint(undefined)).toBe(fingerprint(null));
+  });
+
+  it("rejects values that cannot be canonicalized deterministically", () => {
+    expect(() => fingerprint(new Map([["a", 1]]))).toThrow(TypeError);
+    expect(() => fingerprint(new Set([1, 2]))).toThrow(TypeError);
+    expect(() => fingerprint(/a/)).toThrow(TypeError);
+    expect(() => fingerprint(10n)).toThrow(TypeError);
+    expect(() => fingerprint(Object.assign(new (class C {})(), { a: 1 }))).toThrow(TypeError);
+  });
 });
 
 describe("PlanStore.create", () => {
@@ -292,15 +346,22 @@ describe("PlanStore.listPending", () => {
     expect(pending.map((p) => p.planToken)).toEqual([gated]);
   });
 
-  it("sorts soonest-expiring first", () => {
-    const store = makeStore();
-    const tokens: string[] = [];
-    for (let i = 0; i < 3; i++) {
-      tokens.push(store.create({ i }, meta("t", { approvalRequired: true })).planToken);
+  it("sorts soonest-expiring first, not insertion order", () => {
+    vi.useFakeTimers();
+    try {
+      const store = makeStore();
+      // Insert `later` first (time 1_000), then rewind the clock and insert
+      // `earlier` (time 0): listPending() must sort by expiry, so the result
+      // is [earlier, later] even though insertion order is [later, earlier].
+      vi.setSystemTime(1_000);
+      const later = store.create({ i: 0 }, meta("t", { approvalRequired: true })).planToken;
+      vi.setSystemTime(0);
+      const earlier = store.create({ i: 1 }, meta("t", { approvalRequired: true })).planToken;
+
+      expect(store.listPending().map((plan) => plan.planToken)).toEqual([earlier, later]);
+    } finally {
+      vi.useRealTimers();
     }
-    const pending = store.listPending();
-    // Creation order == expiry order under real timers (same TTL); assert all three present.
-    expect(pending).toHaveLength(3);
   });
 
   it("carries payload, reason, previewCount, and extra for rendering", () => {
@@ -353,9 +414,20 @@ describe("PlanStore.sweep", () => {
     vi.advanceTimersByTime(TTL_MS + 1);
     store.sweep();
     // expiring: expired -> gone; usable: used -> gone; rejectedToken: tombstone kept.
-    expect(store.consume(expiring, { id: "a" }).ok).toBe(false);
-    expect(store.consume(rejectedToken, { id: "c" }).ok).toBe(false);
+    const expired = store.consume(expiring, { id: "a" });
+    expect(expired.ok).toBe(false);
+    if (!expired.ok) {
+      expect(expired.error.code).toBe("UNKNOWN_TOKEN");
+    }
+
+    const used = store.consume(usable, { id: "b" });
+    expect(used.ok).toBe(false);
+    if (!used.ok) {
+      expect(used.error.code).toBe("UNKNOWN_TOKEN");
+    }
+
     const afterSweep = store.consume(rejectedToken, { id: "c" });
+    expect(afterSweep.ok).toBe(false);
     if (!afterSweep.ok) {
       expect(afterSweep.error.code).toBe("PLAN_REJECTED");
     }
