@@ -12,3 +12,11 @@ export type {
   PlanStoreOptions,
   RejectResult,
 } from "./planStore.js";
+export { createApprovalServer, startApprovalServer } from "./approvalServer.js";
+export type {
+  ApprovalDecision,
+  ApprovalServerHandle,
+  ApprovalServerOptions,
+  RenderablePlan,
+  RenderPlan,
+} from "./approvalServer.js";
