@@ -1,5 +1,7 @@
 import { randomBytes } from "node:crypto";
 
+import { NoopSink } from "./audit.js";
+import type { AuditEvent, AuditSink, AuditStatus } from "./audit.js";
 import { fingerprint } from "./fingerprint.js";
 import { PlanError } from "./errors.js";
 
@@ -98,6 +100,8 @@ interface TokenEntry<TPayload> {
 export interface PlanStoreOptions {
   /** How long a plan token stays valid (ms). */
   planTtlMs: number;
+  /** Audit sink the store emits lifecycle events to. Defaults to NoopSink. */
+  audit?: AuditSink;
 }
 
 /**
@@ -113,25 +117,30 @@ export interface PlanStoreOptions {
  */
 export class PlanStore<TPayload> {
   private tokens = new Map<string, TokenEntry<TPayload>>();
+  private audit: AuditSink;
 
-  constructor(private opts: PlanStoreOptions) {}
+  constructor(private opts: PlanStoreOptions) {
+    this.audit = opts.audit ?? NoopSink;
+  }
 
   create(payload: TPayload, options: PlanCreateOptions): PlanCreated {
+    const startedAt = Date.now();
     this.sweep();
     const token = randomBytes(24).toString("hex");
     const requiresApproval = options.alwaysRequireApproval === true || options.approvalRequired === true;
     const expiresAt = Date.now() + this.opts.planTtlMs;
+    const meta: PlanMeta = {
+      tool: options.tool,
+      reason: options.reason ?? null,
+      callerId: options.callerId ?? "unknown",
+      previewCount: options.previewCount ?? null,
+      dataDigest: options.dataDigest ?? null,
+      extra: options.extra ?? {},
+    };
     this.tokens.set(token, {
       payload,
       fingerprint: fingerprint(payload),
-      meta: {
-        tool: options.tool,
-        reason: options.reason ?? null,
-        callerId: options.callerId ?? "unknown",
-        previewCount: options.previewCount ?? null,
-        dataDigest: options.dataDigest ?? null,
-        extra: options.extra ?? {},
-      },
+      meta,
       expiresAt,
       used: false,
       requiresApproval,
@@ -139,6 +148,7 @@ export class PlanStore<TPayload> {
       rejected: false,
       rejectionReason: null,
     });
+    this.emit(startedAt, requiresApproval ? "awaiting_approval" : "previewed", token, meta);
     return {
       planToken: token,
       status: requiresApproval ? "awaiting_approval" : "previewed",
@@ -184,51 +194,51 @@ export class PlanStore<TPayload> {
    * server), never through an agent-facing MCP tool.
    */
   approve(planToken: string): ApproveResult {
+    const startedAt = Date.now();
     const entry = this.tokens.get(planToken);
     if (!entry) {
-      return {
-        ok: false,
-        error: new PlanError(
-          "UNKNOWN_TOKEN",
-          "No plan matches this token. It may have been revoked or never issued.",
-        ),
-        meta: null,
-      };
+      return this.failed(
+        startedAt,
+        planToken,
+        null,
+        new PlanError("UNKNOWN_TOKEN", "No plan matches this token. It may have been revoked or never issued."),
+      );
     }
     if (entry.rejected) {
-      return {
-        ok: false,
-        error: new PlanError(
+      return this.failed(
+        startedAt,
+        planToken,
+        entry.meta,
+        new PlanError(
           "PLAN_REJECTED",
           "This plan was rejected by a human reviewer and cannot be approved.",
           "A rejected plan cannot be un-rejected. Narrow the operation and re-preview to get a fresh token.",
         ),
-        meta: entry.meta,
-      };
+      );
     }
     if (entry.used) {
-      return {
-        ok: false,
-        error: new PlanError(
-          "PLAN_USED",
-          "This plan token was already used and can no longer be approved.",
-        ),
-        meta: entry.meta,
-      };
+      return this.failed(
+        startedAt,
+        planToken,
+        entry.meta,
+        new PlanError("PLAN_USED", "This plan token was already used and can no longer be approved."),
+      );
     }
     if (Date.now() > entry.expiresAt) {
       this.tokens.delete(planToken);
-      return {
-        ok: false,
-        error: new PlanError(
+      return this.failed(
+        startedAt,
+        planToken,
+        entry.meta,
+        new PlanError(
           "PLAN_EXPIRED",
           "This plan token has expired. Re-run the write to obtain a fresh preview and token.",
         ),
-        meta: entry.meta,
-      };
+      );
     }
     const alreadyApproved = entry.approved;
     entry.approved = true;
+    this.emit(startedAt, "approved", planToken, entry.meta);
     return { ok: true, alreadyApproved, meta: entry.meta };
   }
 
@@ -242,26 +252,23 @@ export class PlanStore<TPayload> {
    * without changing anything. The first rejection reason wins.
    */
   reject(planToken: string, reason: string | null): RejectResult {
+    const startedAt = Date.now();
     const entry = this.tokens.get(planToken);
     if (!entry) {
-      return {
-        ok: false,
-        error: new PlanError(
-          "UNKNOWN_TOKEN",
-          "No plan matches this token. It may have been revoked or never issued.",
-        ),
-        meta: null,
-      };
+      return this.failed(
+        startedAt,
+        planToken,
+        null,
+        new PlanError("UNKNOWN_TOKEN", "No plan matches this token. It may have been revoked or never issued."),
+      );
     }
     if (entry.used) {
-      return {
-        ok: false,
-        error: new PlanError(
-          "PLAN_USED",
-          "This plan token was already executed and can no longer be rejected.",
-        ),
-        meta: entry.meta,
-      };
+      return this.failed(
+        startedAt,
+        planToken,
+        entry.meta,
+        new PlanError("PLAN_USED", "This plan token was already executed and can no longer be rejected."),
+      );
     }
     // Skip the expiry check once already rejected: an already-dead token must
     // stay reported as PLAN_REJECTED forever, not flip to PLAN_EXPIRED (and
@@ -269,18 +276,17 @@ export class PlanStore<TPayload> {
     // calls.
     if (!entry.rejected && Date.now() > entry.expiresAt) {
       this.tokens.delete(planToken);
-      return {
-        ok: false,
-        error: new PlanError(
-          "PLAN_EXPIRED",
-          "This plan token has already expired. There is nothing left to reject.",
-        ),
-        meta: entry.meta,
-      };
+      return this.failed(
+        startedAt,
+        planToken,
+        entry.meta,
+        new PlanError("PLAN_EXPIRED", "This plan token has already expired. There is nothing left to reject."),
+      );
     }
     const alreadyRejected = entry.rejected;
     entry.rejected = true;
     if (!entry.rejectionReason && reason) entry.rejectionReason = reason;
+    this.emit(startedAt, "rejected", planToken, entry.meta);
     return { ok: true, alreadyRejected, meta: entry.meta };
   }
 
@@ -293,77 +299,79 @@ export class PlanStore<TPayload> {
    * later approve() + consume() can succeed.
    */
   consume(planToken: string, payload: TPayload): ConsumeResult<TPayload> {
+    const startedAt = Date.now();
     const entry = this.tokens.get(planToken);
     if (!entry) {
-      return {
-        ok: false,
-        error: new PlanError(
-          "UNKNOWN_TOKEN",
-          "No plan matches this token. It may have been revoked or never issued.",
-        ),
-        meta: null,
-      };
+      return this.failed(
+        startedAt,
+        planToken,
+        null,
+        new PlanError("UNKNOWN_TOKEN", "No plan matches this token. It may have been revoked or never issued."),
+      );
     }
     if (entry.rejected) {
-      return {
-        ok: false,
-        error: new PlanError(
+      return this.failed(
+        startedAt,
+        planToken,
+        entry.meta,
+        new PlanError(
           "PLAN_REJECTED",
           entry.rejectionReason
             ? `This plan was rejected by a human reviewer: ${entry.rejectionReason}`
             : "This plan was rejected by a human reviewer.",
           "This plan cannot be executed. Narrow the operation and re-preview to get a fresh token.",
         ),
-        meta: entry.meta,
-      };
+      );
     }
     if (entry.used) {
       this.tokens.delete(planToken);
-      return {
-        ok: false,
-        error: new PlanError(
-          "PLAN_USED",
-          "This plan token was already used. A plan token can only be executed once.",
-        ),
-        meta: entry.meta,
-      };
+      return this.failed(
+        startedAt,
+        planToken,
+        entry.meta,
+        new PlanError("PLAN_USED", "This plan token was already used. A plan token can only be executed once."),
+      );
     }
     if (Date.now() > entry.expiresAt) {
       this.tokens.delete(planToken);
-      return {
-        ok: false,
-        error: new PlanError(
+      return this.failed(
+        startedAt,
+        planToken,
+        entry.meta,
+        new PlanError(
           "PLAN_EXPIRED",
           "This plan token has expired. Re-run the write to obtain a fresh preview and token.",
         ),
-        meta: entry.meta,
-      };
+      );
     }
     if (entry.fingerprint !== fingerprint(payload)) {
-      return {
-        ok: false,
-        error: new PlanError(
+      return this.failed(
+        startedAt,
+        planToken,
+        entry.meta,
+        new PlanError(
           "PLAN_MISMATCH",
           "The payload does not match the plan the token was issued for.",
           "Pass back the exact payload from the preview response.",
         ),
-        meta: entry.meta,
-      };
+      );
     }
     if (entry.requiresApproval && !entry.approved) {
       // Deliberately does not delete or mark the token used: it stays pending
       // so a later approve() + consume() can still succeed.
-      return {
-        ok: false,
-        error: new PlanError(
+      return this.failed(
+        startedAt,
+        planToken,
+        entry.meta,
+        new PlanError(
           "AWAITING_APPROVAL",
           "This plan requires human approval and has not been approved yet.",
           "Approval happens out-of-band through a human approval process — it cannot be approved by the requesting agent. Wait for approval, or narrow the operation and re-preview.",
         ),
-        meta: entry.meta,
-      };
+      );
     }
     entry.used = true;
+    this.emit(startedAt, "executed", planToken, entry.meta);
     return { ok: true, meta: entry.meta };
   }
 
@@ -382,5 +390,50 @@ export class PlanStore<TPayload> {
         this.tokens.delete(token);
       }
     }
+  }
+
+  /**
+   * Emits a lifecycle event to the configured audit sink. The sink's contract
+   * is "never throw", but this is wrapped anyway so a misbehaving sink can
+   * never turn a failed audit write into a failed plan transition — a lost
+   * audit row must not be confused with a lifecycle that didn't happen.
+   */
+  private emit(
+    startedAt: number,
+    status: AuditStatus,
+    planToken: string,
+    meta: PlanMeta | null,
+    detail?: string | null,
+  ): void {
+    const event: AuditEvent = {
+      ts: Date.now(),
+      tool: meta?.tool ?? "unknown",
+      reason: meta?.reason ?? null,
+      planToken,
+      status,
+      previewCount: meta?.previewCount ?? null,
+      callerId: meta?.callerId ?? "unknown",
+      durationMs: Date.now() - startedAt,
+      detail: detail ?? null,
+    };
+    try {
+      this.audit.record(event);
+    } catch (err) {
+      process.stderr.write(`audit sink failed: ${String(err)}\n`);
+    }
+  }
+
+  /**
+   * Builds a failure result and audits it as "failed" in one step, so every
+   * refusal path records its transition without duplicating the emit call.
+   */
+  private failed(
+    startedAt: number,
+    planToken: string,
+    meta: PlanMeta | null,
+    error: PlanError,
+  ): { ok: false; error: PlanError; meta: PlanMeta | null } {
+    this.emit(startedAt, "failed", planToken, meta, `${error.code}: ${error.message}`);
+    return { ok: false, error, meta };
   }
 }
