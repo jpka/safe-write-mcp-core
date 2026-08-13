@@ -45,6 +45,33 @@ describe("fingerprint", () => {
     expect(fingerprint(new Date(1_700_000_000_000))).not.toBe(fingerprint({}));
   });
 
+  it("calls toJSON with the enclosing JSON key", () => {
+    const keySensitive = {
+      value: {
+        toJSON(key: string) {
+          return key === "value" ? "nested-key" : "other-key";
+        },
+      },
+    };
+    expect(fingerprint(keySensitive)).toBe(fingerprint({ value: "nested-key" }));
+  });
+
+  it("omits object members whose toJSON returns undefined, like JSON.stringify", () => {
+    const member = { a: { toJSON: () => undefined }, b: 1 };
+    expect(fingerprint(member)).toBe(fingerprint({ b: 1 }));
+    expect(fingerprint(member)).not.toBe(fingerprint({ a: null, b: 1 }));
+  });
+
+  it("rejects cyclic payloads with a deliberate error, not a RangeError", () => {
+    const cyclicObject: Record<string, unknown> = {};
+    cyclicObject.self = cyclicObject;
+    expect(() => fingerprint(cyclicObject)).toThrow(TypeError);
+
+    const cyclicArray: unknown[] = [];
+    cyclicArray.push(cyclicArray);
+    expect(() => fingerprint(cyclicArray)).toThrow(TypeError);
+  });
+
   it("keeps distinct fingerprints for [undefined], [null], holes, and []", () => {
     const holey: unknown[] = [];
     holey.length = 1; // [ <1 empty item> ]
@@ -319,16 +346,19 @@ describe("PlanStore.listPending", () => {
     expect(pending.map((p) => p.planToken)).toEqual([gated]);
   });
 
-  it("sorts soonest-expiring first", () => {
+  it("sorts soonest-expiring first, not insertion order", () => {
     vi.useFakeTimers();
     try {
       const store = makeStore();
-      const tokens: string[] = [];
-      for (let i = 0; i < 3; i++) {
-        tokens.push(store.create({ i }, meta("t", { approvalRequired: true })).planToken);
-        vi.advanceTimersByTime(1);
-      }
-      expect(store.listPending().map((plan) => plan.planToken)).toEqual(tokens);
+      // Insert `later` first (time 1_000), then rewind the clock and insert
+      // `earlier` (time 0): listPending() must sort by expiry, so the result
+      // is [earlier, later] even though insertion order is [later, earlier].
+      vi.setSystemTime(1_000);
+      const later = store.create({ i: 0 }, meta("t", { approvalRequired: true })).planToken;
+      vi.setSystemTime(0);
+      const earlier = store.create({ i: 1 }, meta("t", { approvalRequired: true })).planToken;
+
+      expect(store.listPending().map((plan) => plan.planToken)).toEqual([earlier, later]);
     } finally {
       vi.useRealTimers();
     }
