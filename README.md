@@ -13,8 +13,8 @@ Two-phase write core for MCP servers: preview-then-execute plan tokens, out-of-b
 An agent running a write-capable MCP server is one keystroke away from "UPDATE products SET price = 0". The safe-write pattern forces every mutating operation through a two-phase lifecycle that a human can intercept:
 
 1. **Preview** — the host runs the read-only half of the operation (or estimates its impact) and asks the core for a plan.
-2. **Decide** — a gated plan sits in a pending queue until a human approves or rejects it on a localhost approval page. No agent-visible path can approve it.
-3. **Execute** — the agent redeems the plan token with the *exact* previewed payload. Any change to the payload, the token, or the plan's state is refused.
+2. **Decide** — a gated plan sits in a pending queue until a human approves or rejects it on a localhost approval page. The core never exposes approval to an agent: `PlanStore.approve()` is public API, so hosts must keep it out of agent-facing handlers and tools — the only sanctioned path is the human approval page.
+3. **Execute** — the agent redeems the plan token with a payload whose canonical JSON fingerprint matches the previewed one (object key order may differ). Any change to the payload's fingerprint, the token, or the plan's state is refused.
 
 The core owns the plan lifecycle only. Everything policy-shaped — thresholds, hard caps, what a preview looks like, how data is persisted — is the host's job, which is what keeps this package generic enough to be shared.
 
@@ -22,10 +22,10 @@ The core owns the plan lifecycle only. Everything policy-shaped — thresholds, 
 
 - **Fingerprint-bound plan tokens.** A plan token is bound to a sha256 fingerprint of the previewed payload (canonical JSON: sorted keys, JSON.stringify semantics). `consume()` recomputes the fingerprint and refuses `PLAN_MISMATCH` if the payload changed — the caller can't claim "same thing, trust me".
 - **Single-use, expiring tokens.** A token executes at most once; a second `consume()` is `PLAN_USED` and the entry is pruned. Tokens expire after `planTtlMs`; `consume()`/`approve()`/`reject()` on an expired token are `PLAN_EXPIRED` (and the entry is pruned).
-- **Out-of-band human approval.** Gated plans start `awaiting_approval` and cannot be consumed until approved. Approval only happens through the localhost approval server (or a host equivalent); `PlanStore.approve()` is not exposed to agents. `alwaysRequireApproval` forces the gate on operations that must always be human-approved (e.g. `run_migration`), and is a flag only tool-module code may set — never agent-supplied arguments.
-- **Reject is permanent.** `reject()` writes a tombstone that outlives expiry and the sweep: a rejected plan reports `PLAN_REJECTED` ahead of every other check, forever. Rejection reasons are surfaced back to the agent's next `consume()` attempt. Rejecting twice is an idempotent no-op.
+- **Out-of-band human approval.** Gated plans start `awaiting_approval` and cannot be consumed until approved. Approval only happens through the localhost approval server (or a host equivalent) — the core ships no agent-facing approval surface, and hosts must keep `PlanStore.approve()` out of agent-facing handlers and tools. `alwaysRequireApproval` forces the gate on operations that must always be human-approved (e.g. `run_migration`), and is a flag only tool-module code may set — never agent-supplied arguments.
+- **Reject is permanent for the process lifetime.** `reject()` writes a tombstone that outlives expiry and the sweep: a rejected plan reports `PLAN_REJECTED` ahead of every other check, until the process exits. Tombstones are in-memory only (see DECISIONS.md) — a restart loses them and a later `consume()` returns `UNKNOWN_TOKEN`. Rejection reasons are surfaced back to the agent's next `consume()` attempt. Rejecting twice is an idempotent no-op.
 - **Deterministic gate ordering.** `consume()` checks, in order: rejected → used → expired → fingerprint mismatch → awaiting approval. Hosts and reviewers can rely on which error wins.
-- **Audit events on every transition.** `previewed`/`awaiting_approval`/`approved`/`rejected`/`executed`/`failed` are emitted to an injectable `AuditSink` (default `NoopSink`). The sink contract is synchronous and never-throwing; a misbehaving sink is reported to stderr, never allowed to change a plan result.
+- **Audit events on every transition the core owns.** `previewed`/`awaiting_approval`/`approved`/`rejected`/`executed`/`failed` are emitted to an injectable `AuditSink` (default `NoopSink`) — including every refusal path. The sink contract is synchronous and never-throwing; a misbehaving sink is reported to stderr, never allowed to change a plan result. Host execution errors that happen *after* `consume()` succeeds are outside the core's lifecycle and must be audited by the host through the shared `AuditSink`.
 
 ## The preview/execute seam
 
@@ -47,15 +47,18 @@ type Payload = { items: Array<{ id: number; price: number }> };
 
 const store = new PlanStore<Payload>({ planTtlMs: 60_000 });
 
-// Tool handler: preview half
-const { planToken, status } = store.create(payload, {
-  tool: "update_prices",
-  reason: "markdown for the sale window",
-  previewCount: payload.items.length,
-  approvalRequired: payload.items.length > 50,
-});
-if (status === "awaiting_approval") {
-  // Tell the agent: wait for human approval on the localhost page.
+// Tool handler: preview half — runs the read-only preview, then asks the core for a plan
+function previewTool(payload: Payload): { planToken: string; approved: boolean } {
+  const { planToken, status } = store.create(payload, {
+    tool: "update_prices",
+    reason: "markdown for the sale window",
+    previewCount: payload.items.length,
+    approvalRequired: payload.items.length > 50,
+  });
+  // When the plan gates on approval, the handler is done: tell the agent to
+  // wait for a human on the localhost page. Do NOT proceed to consume() yet.
+  if (status === "awaiting_approval") return { planToken, approved: false };
+  return { planToken, approved: true };
 }
 
 // Host startup: human approval surface on the same process/store
@@ -67,9 +70,12 @@ const { port } = await startApprovalServer(store, {
   onDecision: (decision) => myAudit.record(decision), // host's own persistence
 });
 
-// Tool handler: execute half
-const result = store.consume(planToken, payload); // re-verifies the payload
-if (!result.ok) throw new Error(result.error.message);
+// Tool handler: execute half — runs only after approval (either the plan was
+// not gated, or a human approved it on the localhost page)
+function executeTool(planToken: string, payload: Payload): void {
+  const result = store.consume(planToken, payload); // re-verifies the payload
+  if (!result.ok) throw new Error(result.error.message);
+}
 ```
 
 ## API surface
@@ -95,7 +101,7 @@ Hosts extend the vocabulary with their own domain codes (sw-postgres-mcp's `ROWS
 - Binds to `127.0.0.1` only, never `0.0.0.0` (port `0` = OS-assigned, used by tests).
 - `Host` header must name a loopback host (`127.0.0.1`, `localhost`, `[::1]`) **and** carry the actual bound port; `Origin` and `Sec-Fetch-Site`, when present, must match — this is the DNS-rebinding / CSRF defense.
 - `POST /api/plans/<token>/approve|reject` requires `Content-Type: application/json`, caps bodies at 64 KiB (`413 PAYLOAD_TOO_LARGE`), and never leaks internal error text to clients.
-- Responses are `Cache-Control: no-store`; errors are structured `{ ok, code, message, hint }`.
+- Responses are `Cache-Control: no-store`; errors are structured `{ ok, code, message, hint }` with `hint` optional (omitted by `FORBIDDEN`, `UNSUPPORTED_MEDIA_TYPE`, `PAYLOAD_TOO_LARGE`, `NOT_FOUND`, and `INTERNAL_ERROR`).
 
 ## Development
 
