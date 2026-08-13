@@ -14,7 +14,18 @@ import type { PendingPlan } from "./planStore.js";
  */
 const LOOPBACK_HOST = "127.0.0.1";
 
+/** Host-header names that all resolve to this machine's loopback interface. */
+const LOOPBACK_HOST_NAMES = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
+
 const MAX_BODY_BYTES = 64 * 1024;
+
+/** Rejects `readJsonBody` when a request body exceeds MAX_BODY_BYTES. */
+class BodyTooLargeError extends Error {
+  constructor() {
+    super(`request body exceeds ${MAX_BODY_BYTES} bytes`);
+    this.name = "BodyTooLargeError";
+  }
+}
 
 /**
  * A plan's human-readable display fields, produced by the host's
@@ -76,8 +87,10 @@ function readJsonBody(req: http.IncomingMessage): Promise<Record<string, unknown
     req.on("data", (chunk: Buffer) => {
       size += chunk.length;
       if (size > MAX_BODY_BYTES) {
-        reject(new Error("request body too large"));
-        req.destroy();
+        // Pause, don't destroy: the handler must still be able to write a 413
+        // response. The socket is destroyed once that response has flushed.
+        req.pause();
+        reject(new BodyTooLargeError());
         return;
       }
       chunks.push(chunk);
@@ -149,23 +162,37 @@ function stringField(body: Record<string, unknown>, key: string): string | null 
  * Origin the request came from (when present), and the browser-set
  * Sec-Fetch-Site hint.
  *
- * `Host` is checked against `req.socket.localPort` (the actual bound port)
- * rather than the configured port, which can be 0 ("pick any free port").
+ * `Host` must name a loopback host (`127.0.0.1`, `localhost`, or a bracketed
+ * IPv6 loopback) AND carry the actual bound port — checked against
+ * `req.socket.localPort` rather than the configured port, which can be 0
+ * ("pick any free port"). Pinning the port keeps the DNS-rebinding defense
+ * intact: an attacker-controlled hostname is never in the allowed set, and
+ * the allowed names can't be pointed anywhere but this machine.
  *
  * `Origin` and `Sec-Fetch-Site` are only enforced when present: non-browser
  * clients (curl, the test suite) never send them, and that's a legitimate
  * way to reach this server — only a *mismatched* value is evidence of a
  * cross-origin request.
  */
+function splitHostHeader(hostHeader: string): { name: string; port: string | null } {
+  const lastColon = hostHeader.lastIndexOf(":");
+  if (lastColon === -1 || hostHeader.endsWith("]")) return { name: hostHeader, port: null };
+  return { name: hostHeader.slice(0, lastColon), port: hostHeader.slice(lastColon + 1) };
+}
+
 function checkRequestProvenance(req: http.IncomingMessage): string | null {
-  const expectedHost = `${LOOPBACK_HOST}:${req.socket.localPort}`;
+  const expectedPort = String(req.socket.localPort);
   const hostHeader = req.headers.host;
-  if (hostHeader !== expectedHost) {
-    return `Host header must be "${expectedHost}", got ${hostHeader ? `"${hostHeader}"` : "(none)"}`;
+  if (typeof hostHeader !== "string") {
+    return "Host header is required";
+  }
+  const { name, port } = splitHostHeader(hostHeader);
+  if (!LOOPBACK_HOST_NAMES.has(name.toLowerCase()) || port !== expectedPort) {
+    return `Host header must name loopback on port ${expectedPort}, got "${hostHeader}"`;
   }
 
   const origin = req.headers.origin;
-  if (typeof origin === "string" && origin !== `http://${expectedHost}`) {
+  if (typeof origin === "string" && origin !== `http://${hostHeader}`) {
     return `Origin header "${origin}" does not match this server's origin`;
   }
 
@@ -347,8 +374,11 @@ export function createApprovalServer<TPayload>(
 
   return http.createServer((req, res) => {
     void handleRequest(store, renderPlan, title, onDecision, req, res).catch((err) => {
+      // Never leak internal error text to a client — log it server-side and
+      // send a stable generic message instead.
+      process.stderr.write(`approval server error: ${String(err)}\n`);
       if (!res.headersSent) {
-        sendJson(res, 500, { ok: false, code: "INTERNAL_ERROR", message: String(err) });
+        sendJson(res, 500, { ok: false, code: "INTERNAL_ERROR", message: "Internal server error" });
       } else {
         res.end();
       }
@@ -414,7 +444,25 @@ async function handleRequest<TPayload>(
       return;
     }
     const action = actionMatch[2] as "approve" | "reject";
-    const body = await readJsonBody(req);
+    let body: Record<string, unknown>;
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      if (err instanceof BodyTooLargeError) {
+        // The request body is still streaming in (paused, not consumed).
+        // Signal the client not to reuse this connection and tear the socket
+        // down once the 413 has flushed.
+        res.setHeader("Connection", "close");
+        res.once("finish", () => req.destroy());
+        sendJson(res, 413, {
+          ok: false,
+          code: "PAYLOAD_TOO_LARGE",
+          message: `Request body exceeds the ${MAX_BODY_BYTES}-byte limit`,
+        });
+        return;
+      }
+      throw err;
+    }
 
     let decision: ApprovalDecision;
     if (action === "approve") {

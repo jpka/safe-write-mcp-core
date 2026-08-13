@@ -10,7 +10,12 @@ function makeStore(audit?: AuditSink, ttlMs = 60_000): PlanStore<Payload> {
 }
 
 function collect(events: AuditEvent[]): AuditSink {
-  return { record: (e) => events.push(e) };
+  return {
+    record(e) {
+      events.push(e);
+      return undefined;
+    },
+  };
 }
 
 describe("AuditSink lifecycle events", () => {
@@ -64,6 +69,34 @@ describe("AuditSink lifecycle events", () => {
     expect(events.map((e) => e.status)).toEqual(["awaiting_approval", "rejected", "failed"]);
   });
 
+  it("does not emit lifecycle events for idempotent approve/reject no-ops", () => {
+    const events: AuditEvent[] = [];
+    const store = makeStore(collect(events));
+    const { planToken: gated } = store.create({ op: "x" }, { tool: "t", approvalRequired: true });
+    const { planToken: gated2 } = store.create({ op: "y" }, { tool: "t", approvalRequired: true });
+
+    const firstApprove = store.approve(gated);
+    expect(firstApprove.ok).toBe(true);
+    expect(firstApprove.alreadyApproved).toBe(false);
+    const reApprove = store.approve(gated);
+    expect(reApprove.ok).toBe(true);
+    expect(reApprove.alreadyApproved).toBe(true);
+
+    const firstReject = store.reject(gated2, null);
+    expect(firstReject.ok).toBe(true);
+    expect(firstReject.alreadyRejected).toBe(false);
+    const reReject = store.reject(gated2, null);
+    expect(reReject.ok).toBe(true);
+    expect(reReject.alreadyRejected).toBe(true);
+
+    expect(events.map((e) => e.status)).toEqual([
+      "awaiting_approval",
+      "awaiting_approval",
+      "approved",
+      "rejected",
+    ]);
+  });
+
   it("emits executed on a successful consume, failed on every gate refusal", () => {
     const events: AuditEvent[] = [];
     const store = makeStore(collect(events));
@@ -115,6 +148,26 @@ describe("audit sink failure isolation", () => {
       // create emits -> sink throws -> swallowed; store still works.
       const { planToken } = store.create({ op: "x" }, { tool: "t" });
       expect(store.consume(planToken, { op: "x" }).ok).toBe(true);
+      expect(spy).toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("a rejected-promise sink reports the failure but never breaks a plan transition", async () => {
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      const rejecting = {
+        record(): Promise<undefined> {
+          return Promise.reject(new Error("db unreachable"));
+        },
+      } as unknown as AuditSink;
+      const store = makeStore(rejecting);
+      // create emits -> sink's promise rejects -> rejection handled, store still works.
+      const { planToken } = store.create({ op: "x" }, { tool: "t" });
+      expect(store.consume(planToken, { op: "x" }).ok).toBe(true);
+      // The rejection handler runs on a microtask; give it a tick.
+      await new Promise((resolve) => setTimeout(resolve, 0));
       expect(spy).toHaveBeenCalled();
     } finally {
       spy.mockRestore();

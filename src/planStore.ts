@@ -238,7 +238,9 @@ export class PlanStore<TPayload> {
     }
     const alreadyApproved = entry.approved;
     entry.approved = true;
-    this.emit(startedAt, "approved", planToken, entry.meta);
+    if (!alreadyApproved) {
+      this.emit(startedAt, "approved", planToken, entry.meta);
+    }
     return { ok: true, alreadyApproved, meta: entry.meta };
   }
 
@@ -286,7 +288,9 @@ export class PlanStore<TPayload> {
     const alreadyRejected = entry.rejected;
     entry.rejected = true;
     if (!entry.rejectionReason && reason) entry.rejectionReason = reason;
-    this.emit(startedAt, "rejected", planToken, entry.meta);
+    if (!alreadyRejected) {
+      this.emit(startedAt, "rejected", planToken, entry.meta);
+    }
     return { ok: true, alreadyRejected, meta: entry.meta };
   }
 
@@ -417,7 +421,15 @@ export class PlanStore<TPayload> {
       detail: detail ?? null,
     };
     try {
-      this.audit.record(event);
+      const result = this.audit.record(event) as unknown;
+      if (result && typeof (result as { then?: unknown }).then === "function") {
+        // Defense-in-depth for JS hosts that ignore the `undefined` return
+        // contract: a rejected promise would otherwise become an unhandled
+        // rejection. Report it, never let it change the plan result.
+        Promise.resolve(result).catch((err: unknown) => {
+          process.stderr.write(`audit sink failed: ${String(err)}\n`);
+        });
+      }
     } catch (err) {
       process.stderr.write(`audit sink failed: ${String(err)}\n`);
     }
