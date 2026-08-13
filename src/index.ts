@@ -1,5 +1,7 @@
 export { PlanError } from "./errors.js";
 export type { PlanErrorCode } from "./errors.js";
+export { NoopSink } from "./audit.js";
+export type { AuditEvent, AuditSink, AuditStatus } from "./audit.js";
 export { fingerprint } from "./fingerprint.js";
 export { PlanStore } from "./planStore.js";
 export type {
