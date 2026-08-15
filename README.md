@@ -2,9 +2,7 @@
 
 Two-phase write core for MCP servers: preview-then-execute plan tokens, out-of-band localhost approval, and audit hooks. Zero runtime dependencies, transport-agnostic — hosts supply `preview()`/`execute()` callbacks and an audit persistence implementation.
 
-**Status:** core complete (plan store, approval server, audit). Version 0.1.0, not yet published.
-
-**Consumers:** [sw-postgres-mcp](https://github.com/jpka/sw-postgres-mcp) · [shopify-operations-mcp](https://github.com/jpka/shopify-operations-mcp)
+**Status:** core complete (plan store, approval server, audit). Version 0.1.0, published.
 
 ---
 
