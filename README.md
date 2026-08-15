@@ -1,4 +1,4 @@
-# safe-write-mcp-core
+# Safe-write MCP core
 
 Two-phase write core for MCP servers: preview-then-execute plan tokens, out-of-band localhost approval, and audit hooks. Zero runtime dependencies, transport-agnostic — hosts supply `preview()`/`execute()` callbacks and an audit persistence implementation.
 
