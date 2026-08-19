@@ -97,22 +97,28 @@ describe("AuditSink lifecycle events", () => {
     ]);
   });
 
-  it("emits executed on a successful consume, failed on every gate refusal", () => {
+  it("emits executing then executed on a successful consume, failed on every gate refusal", () => {
     const events: AuditEvent[] = [];
     const store = makeStore(collect(events));
     const { planToken } = store.create({ op: "x" }, { tool: "t" });
 
     // Wrong payload -> PLAN_MISMATCH (failed).
     store.consume(planToken, { op: "different" });
-    // Correct payload -> executed (token spent).
+    // Correct payload -> executing then executed (token spent).
     const consumed = store.consume(planToken, { op: "x" });
     expect(consumed.ok).toBe(true);
     // Reusing the spent token -> PLAN_USED (failed).
     store.consume(planToken, { op: "x" });
 
-    expect(events.map((e) => e.status)).toEqual(["previewed", "failed", "executed", "failed"]);
+    expect(events.map((e) => e.status)).toEqual([
+      "previewed",
+      "failed",
+      "executing",
+      "executed",
+      "failed",
+    ]);
     expect(events[1].detail).toContain("PLAN_MISMATCH");
-    expect(events[3].detail).toContain("PLAN_USED");
+    expect(events[4].detail).toContain("PLAN_USED");
   });
 
   it("records durationMs and a ts on every event", () => {

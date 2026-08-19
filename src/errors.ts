@@ -8,8 +8,12 @@ export type PlanErrorCode =
   | "PLAN_EXPIRED"
   | "PLAN_USED"
   | "PLAN_MISMATCH"
+  | "DATA_DIGEST_MISMATCH"
   | "AWAITING_APPROVAL"
-  | "PLAN_REJECTED";
+  | "PLAN_REJECTED"
+  | "NOT_EXECUTING"
+  | "ALREADY_EXECUTING"
+  | "NO_RECONCILE";
 
 /**
  * Structured error, mirroring the sw-postgres-mcp convention: `code` is
