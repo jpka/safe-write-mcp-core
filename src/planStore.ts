@@ -173,6 +173,14 @@ export interface PlanStoreOptions {
    * tokens; the core never hardcodes a vendor-specific check. May be async.
    */
   reconcile?: ReconcileCallback;
+  /**
+   * How long `reconcileStuck` waits on the `reconcile` callback before
+   * giving up. A callback that exceeds the deadline (or throws) is treated
+   * as `"unknown"` — the token stays `executing` and queryable, never
+   * guessed — so a hanging host hook cannot block `PlanStore.fromJournal`
+   * recovery forever. Default 30000 ms.
+   */
+  reconcileTimeoutMs?: number;
 }
 
 /**
@@ -228,7 +236,7 @@ export class PlanStore<TPayload> {
       rejectionReason: null,
     };
     this.tokens.set(token, entry);
-    const status: AuditStatus = requiresApproval ? "awaiting_approval" : "previewed";
+    const status = requiresApproval ? "awaiting_approval" : "previewed";
     this.journalTransition(token, status, entry);
     this.emit(startedAt, status, token, meta);
     return {
@@ -672,7 +680,7 @@ export class PlanStore<TPayload> {
     }
     let outcome: ReconcileOutcome;
     try {
-      outcome = await this.opts.reconcile(planToken);
+      outcome = await this.reconcileWithTimeout(planToken);
     } catch (err) {
       // A broken reconcile hook must never guess on the host's behalf.
       process.stderr.write(`reconcile callback failed for ${planToken}: ${String(err)}\n`);
@@ -681,6 +689,34 @@ export class PlanStore<TPayload> {
     if (outcome === "done") return this.confirmExecuted(planToken);
     if (outcome === "not-done") return this.confirmFailed(planToken);
     return { ok: true, meta: entry.meta };
+  }
+
+  /**
+   * Runs the `reconcile` callback against a bounded deadline
+   * (`reconcileTimeoutMs`, default 30000). A callback that overruns the
+   * deadline rejects with a timeout error so the caller can treat it exactly
+   * like a throwing callback — both are the documented `"unknown"` fail-safe,
+   * never a guess. The timer is cleared in `finally` and `unref`'d so it can
+   * neither leak nor keep the process alive after the race is settled.
+   */
+  private async reconcileWithTimeout(planToken: string): Promise<ReconcileOutcome> {
+    const timeoutMs = this.opts.reconcileTimeoutMs ?? 30_000;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const timeout = new Promise<ReconcileOutcome>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        reject(
+          new Error(
+            `reconcile callback timed out after ${timeoutMs}ms; treating the outcome as "unknown"`,
+          ),
+        );
+      }, timeoutMs);
+      timer.unref();
+    });
+    try {
+      return await Promise.race([this.opts.reconcile!(planToken), timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   /**
@@ -728,14 +764,18 @@ export class PlanStore<TPayload> {
 
   /**
    * Legacy one-step execute, kept for backward compatibility. It is a thin
-   * wrapper around `beginExecute` + immediate `confirmExecuted`, so it has
-   * exactly the old semantics — the audit record still claims the side effect
-   * happened even though the host performs it after this returns. New hosts
-   * must use the two-step handoff instead; `consume()` exists so existing
-   * callers keep working and is not recommended for crash-sensitive paths.
+   * wrapper around `beginExecute` + immediate `confirmExecuted`. Compared to
+   * the old pre-v0.2 `consume()`, one behavior is deliberately different:
+   * when `create()` was given a `dataDigest`, the plan now carries one and
+   * `beginExecute` enforces it — so `consume()` fails closed with
+   * `DATA_DIGEST_MISMATCH` unless the current digest is supplied. The audit
+   * record still claims the side effect happened even though the host
+   * performs it after this returns. New hosts must use the two-step handoff
+   * instead; `consume()` exists so existing callers keep working and is not
+   * recommended for crash-sensitive paths.
    */
-  consume(planToken: string, payload: TPayload): ConsumeResult<TPayload> {
-    const begun = this.beginExecute(planToken, payload);
+  consume(planToken: string, payload: TPayload, currentDataDigest?: string | null): ConsumeResult<TPayload> {
+    const begun = this.beginExecute(planToken, payload, currentDataDigest);
     if (!begun.ok) return begun;
     const confirmed = this.confirmExecuted(planToken);
     if (!confirmed.ok) {
@@ -772,11 +812,15 @@ export class PlanStore<TPayload> {
   }
 
   /**
-   * Appends the token's transition to the durable journal *before* the
-   * in-memory change is made visible to callers, so a crash between the two
-   * leaves the journal ahead of the Map — the state a restart replays.
-   * Best-effort like the audit sink: a journal failure is reported to stderr
-   * and never changes the plan result.
+   * Appends the token's transition to the durable journal. The in-memory
+   * mutation and this journal append happen back-to-back in the same
+   * synchronous block with nothing observable in between — callers never see
+   * a gap between the two. The record is durable (fsync'd) before this
+   * method returns to the host. Future maintainers must never insert an
+   * `await` or an early return between the in-memory mutation and the append,
+   * or a crash could leave the journal behind the Map. Best-effort like the
+   * audit sink: a journal failure is reported to stderr and never changes the
+   * plan result.
    */
   private journalTransition(
     planToken: string,
@@ -785,24 +829,30 @@ export class PlanStore<TPayload> {
     detail?: string | null,
   ): void {
     if (!this.journal) return;
-    this.journal.append({
-      ts: Date.now(),
-      planToken,
-      status,
-      detail: detail ?? null,
-      tool: entry.meta.tool,
-      reason: entry.meta.reason,
-      callerId: entry.meta.callerId,
-      previewCount: entry.meta.previewCount,
-      dataDigest: entry.meta.dataDigest,
-      extra: entry.meta.extra,
-      expiresAt: entry.expiresAt,
-      requiresApproval: entry.requiresApproval,
-      approved: entry.approved,
-      rejected: entry.rejected,
-      fingerprint: entry.fingerprint,
-      payload: entry.payload,
-    });
+    try {
+      this.journal.append({
+        ts: Date.now(),
+        planToken,
+        status,
+        detail: detail ?? null,
+        tool: entry.meta.tool,
+        reason: entry.meta.reason,
+        callerId: entry.meta.callerId,
+        previewCount: entry.meta.previewCount,
+        dataDigest: entry.meta.dataDigest,
+        extra: entry.meta.extra,
+        expiresAt: entry.expiresAt,
+        requiresApproval: entry.requiresApproval,
+        approved: entry.approved,
+        rejected: entry.rejected,
+        fingerprint: entry.fingerprint,
+        payload: entry.payload,
+      });
+    } catch (err) {
+      // An unusable journal (broken after a write failure) reports loudly and
+      // still never changes the plan result — see AppendOnlyJournal.append.
+      process.stderr.write(`journal append failed: ${String(err)}\n`);
+    }
   }
 
   /**

@@ -1,5 +1,5 @@
-import { closeSync, fsyncSync, openSync, writeSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { closeSync, createReadStream, fchmodSync, fsyncSync, openSync, writeSync } from "node:fs";
+import { createInterface } from "node:readline";
 
 import type { PlanMeta } from "./planStore.js";
 
@@ -78,19 +78,37 @@ export interface RecoveredExecuting<TPayload = unknown> {
  * fsync failure is reported to stderr and never turns a plan transition into
  * a thrown error. A host that needs a *hard* crash-safety guarantee on a
  * specific transition must treat a stderr journal failure as an alarm.
+ *
+ * A failed write leaves the descriptor in an unknown position, so the journal
+ * is marked unusable after one: subsequent `append()` calls throw instead of
+ * silently appending to a corrupt file.
  */
 export class AppendOnlyJournal {
   private readonly fd: number;
   private readonly path: string;
   private closed = false;
+  private broken = false;
 
   constructor(path: string) {
     this.path = path;
-    this.fd = openSync(path, "a");
+    // 0o600: the journal holds full plan payloads, so new files must never
+    // inherit the process's default (typically group/world-readable) mode.
+    this.fd = openSync(path, "a", 0o600);
+    try {
+      // Tighten an already-existing file to match, best-effort (may be
+      // unsupported on some platforms).
+      fchmodSync(this.fd, 0o600);
+    } catch {
+      // Creation already used 0o600; leaving a pre-existing broader mode is
+      // the host's responsibility — don't fail the open over it.
+    }
   }
 
   append(record: JournalRecord): void {
     if (this.closed) return;
+    if (this.broken) {
+      throw new Error(`journal is unusable after a previous write failure (${this.path})`);
+    }
     let line: string;
     try {
       line = JSON.stringify(record);
@@ -98,10 +116,22 @@ export class AppendOnlyJournal {
       process.stderr.write(`journal: could not serialize record for ${record.planToken}: ${String(err)}\n`);
       return;
     }
+    const data = Buffer.from(line + "\n", "utf8");
     try {
-      writeSync(this.fd, line + "\n");
+      // writeSync is not guaranteed to write the whole buffer in one call —
+      // loop until every byte is on the descriptor, then fsync.
+      let offset = 0;
+      while (offset < data.length) {
+        const written = writeSync(this.fd, data, offset, data.length - offset);
+        if (written <= 0) {
+          throw new Error(`writeSync made no progress (${written} bytes); aborting append`);
+        }
+        offset += written;
+      }
       fsyncSync(this.fd);
     } catch (err) {
+      // The descriptor position is now unknown — never write to it again.
+      this.broken = true;
       process.stderr.write(`journal write failed (${this.path}): ${String(err)}\n`);
     }
   }
@@ -130,9 +160,12 @@ export class AppendOnlyJournal {
 export async function replayJournal<TPayload = unknown>(
   journalPath: string,
 ): Promise<RecoveredExecuting<TPayload>[]> {
-  const raw = await readFile(journalPath, "utf8");
   const latest = new Map<string, JournalRecord>();
-  for (const line of raw.split("\n")) {
+  // Stream line-by-line so an arbitrarily large journal (which may exceed the
+  // single-string limit and carry full payloads) is never loaded whole into
+  // memory at once.
+  const rl = createInterface({ input: createReadStream(journalPath), crlfDelay: Infinity });
+  for await (const line of rl) {
     if (line.trim().length === 0) continue;
     let rec: JournalRecord;
     try {

@@ -82,7 +82,17 @@ function executeTool(planToken: string, payload: Payload): void {
     runSideEffect(payload); // the external, possibly irreversible call
     store.confirmExecuted(planToken); // now — and only now — "executed" is audited
   } catch (err) {
-    store.confirmFailed(planToken); // definitive failure -> token is retryable
+    // Confirm the outcome before choosing. `confirmFailed` is the
+    // *definitive*-failure path: it releases the token back to retryable.
+    // Only call it when the side effect is confirmed to have NOT applied.
+    if (sideEffectDefinitivelyDidNotRun(err)) {
+      store.confirmFailed(planToken);
+    } else {
+      // Indeterminate (timeout, dropped connection): the side effect may have
+      // already run. Leave the token `executing` — it stays queryable via
+      // `listExecuting()` and is settled later by `reconcileStuck()`. Releasing
+      // it here could double-apply the action on a retry.
+    }
     throw err;
   }
 }
@@ -92,7 +102,11 @@ function executeTool(planToken: string, payload: Payload): void {
 // `reconcile`, which answers "did the side effect actually happen?" per token.
 const recoveredStore = await PlanStore.fromJournal("./journal.jsonl", {
   planTtlMs: 60_000,
-  reconcile: async (token) => (myDedupLedger.has(token) ? "done" : "not-done"),
+  reconcile: async (token) => {
+    if (myDedupLedger.has(token)) return "done"; // side effect definitely happened
+    if (myNoOpLedger.has(token)) return "not-done"; // definitely did not happen
+    return "unknown"; // cannot tell -> token stays `executing` and queryable, never guessed
+  },
 });
 ```
 
@@ -109,6 +123,8 @@ Exported from `safe-write-mcp-core`:
 | `startApprovalServer` / `createApprovalServer` | functions | localhost HTTP approval UI (loopback-only, CSRF-hardened) |
 | `AuditSink` / `NoopSink` / `AuditEvent` / `AuditStatus` | type/const | lifecycle event contract |
 | `ReconcileCallback` / `ReconcileOutcome` | type | host's answer to "did the side effect actually happen?" (`done` / `not-done` / `unknown`) |
+| `JournalRecord` / `JournalStatus` | type | journal line schema and its state-transition vocabulary |
+| `RecoveredExecuting` | type | a token a restart found mid-execution, reconstructed from the journal |
 
 ### PlanError codes
 

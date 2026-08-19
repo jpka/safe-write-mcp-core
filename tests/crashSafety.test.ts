@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -351,26 +351,35 @@ describe("dataDigest enforcement", () => {
 
 describe("durable journal", () => {
   let tmpDir: string;
+  const stores: PlanStore<Payload>[] = [];
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "swmc-crash-"));
+    stores.length = 0;
   });
   afterEach(() => {
     vi.useRealTimers();
+    for (const s of stores) s.close();
+    rmSync(tmpDir, { recursive: true, force: true });
   });
 
   function journalPath(): string {
     return join(tmpDir, "journal.jsonl");
   }
 
+  function journalStore(opts: Parameters<typeof makeStore>[0] = {}): PlanStore<Payload> {
+    const s = makeStore({ journalPath: journalPath(), ...opts });
+    stores.push(s);
+    return s;
+  }
+
   it("appends one fsync'd JSON line per state transition", () => {
-    const path = journalPath();
-    const store = makeStore({ journalPath: path });
+    const store = journalStore();
     const { planToken } = store.create({ op: "x" }, meta("t", { reason: "r" }));
     store.beginExecute(planToken, { op: "x" });
     store.confirmExecuted(planToken);
 
-    const lines = readJournal(path);
+    const lines = readJournal(journalPath());
     expect(lines.map((l) => l.status)).toEqual(["previewed", "executing", "executed"]);
     expect(lines[0]).toMatchObject({ planToken, tool: "t", reason: "r", fingerprint: expect.any(String) });
     expect(lines[1]).toMatchObject({ planToken, status: "executing" });
@@ -378,23 +387,21 @@ describe("durable journal", () => {
   });
 
   it("journals confirmFailed with an EXECUTION_FAILED detail", () => {
-    const path = journalPath();
-    const store = makeStore({ journalPath: path });
+    const store = journalStore();
     const { planToken } = store.create({ op: "x" }, meta());
     store.beginExecute(planToken, { op: "x" });
     store.confirmFailed(planToken);
-    const lines = readJournal(path);
+    const lines = readJournal(journalPath());
     expect(lines.map((l) => l.status)).toEqual(["previewed", "executing", "failed"]);
     expect(lines[2].detail).toBe("EXECUTION_FAILED");
   });
 
   it("does not journal gate refusals (they are not transitions)", () => {
-    const path = journalPath();
-    const store = makeStore({ journalPath: path });
+    const store = journalStore();
     const { planToken } = store.create({ op: "x" }, meta());
     store.beginExecute(planToken, { op: "wrong" }); // PLAN_MISMATCH refusal
     store.beginExecute("deadbeef", { op: "x" }); // UNKNOWN_TOKEN refusal
-    expect(readJournal(path)).toHaveLength(1); // only the create line
+    expect(readJournal(journalPath())).toHaveLength(1); // only the create line
   });
 
   it("writes no journal at all when journalPath is omitted (zero config)", () => {
@@ -403,26 +410,37 @@ describe("durable journal", () => {
     store.beginExecute(planToken, { op: "x" });
     store.confirmExecuted(planToken);
     expect(store.listExecuting()).toHaveLength(0);
+    // No journal file and nothing else may have been written to the temp dir.
+    expect(readdirSync(tmpDir)).toHaveLength(0);
   });
 });
 
 describe("replayJournal", () => {
   let tmpDir: string;
+  const stores: PlanStore<Payload>[] = [];
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "swmc-replay-"));
+    stores.length = 0;
   });
   afterEach(() => {
     vi.useRealTimers();
+    for (const s of stores) s.close();
+    rmSync(tmpDir, { recursive: true, force: true });
   });
 
   function journalPath(): string {
     return join(tmpDir, "journal.jsonl");
   }
 
+  function journalStore(opts: Parameters<typeof makeStore>[0] = {}): PlanStore<Payload> {
+    const s = makeStore({ journalPath: journalPath(), ...opts });
+    stores.push(s);
+    return s;
+  }
+
   it("reconstructs only the tokens left executing", async () => {
-    const path = journalPath();
-    const store = makeStore({ journalPath: path });
+    const store = journalStore();
     const { planToken: stuck } = store.create({ op: "a" }, meta("t1"));
     const { planToken: done } = store.create({ op: "b" }, meta("t2"));
     store.beginExecute(stuck, { op: "a" });
@@ -434,7 +452,7 @@ describe("replayJournal", () => {
     // Re-begin so `stuck` is truly executing at crash time.
     store.beginExecute(stuck, { op: "a" });
 
-    const recovered = await replayJournal<Payload>(path);
+    const recovered = await replayJournal<Payload>(journalPath());
     expect(recovered).toHaveLength(1);
     expect(recovered[0].planToken).toBe(stuck);
     expect(recovered[0].fingerprint).toBeDefined();
@@ -443,13 +461,12 @@ describe("replayJournal", () => {
   });
 
   it("skips a torn final line (crash mid-append) and returns the intact records", async () => {
-    const path = journalPath();
-    const store = makeStore({ journalPath: path });
+    const store = journalStore();
     const { planToken } = store.create({ op: "x" }, meta());
     store.beginExecute(planToken, { op: "x" });
     // Simulate a crash that tore the last append: append a partial line.
-    writeFileSync(path, `\n{"ts":1,"planToken":"${planToken}","status":"execut`, { flag: "a" });
-    const recovered = await replayJournal<Payload>(path);
+    writeFileSync(journalPath(), `\n{"ts":1,"planToken":"${planToken}","status":"execut`, { flag: "a" });
+    const recovered = await replayJournal<Payload>(journalPath());
     expect(recovered).toHaveLength(1);
     expect(recovered[0].planToken).toBe(planToken);
   });
@@ -457,25 +474,35 @@ describe("replayJournal", () => {
 
 describe("PlanStore.fromJournal recovery", () => {
   let tmpDir: string;
+  const stores: PlanStore<Payload>[] = [];
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "swmc-recover-"));
+    stores.length = 0;
   });
   afterEach(() => {
     vi.useRealTimers();
+    for (const s of stores) s.close();
+    rmSync(tmpDir, { recursive: true, force: true });
   });
 
   function journalPath(): string {
     return join(tmpDir, "journal.jsonl");
   }
 
+  function journalStore(opts: Parameters<typeof makeStore>[0] = {}): PlanStore<Payload> {
+    const s = makeStore({ journalPath: journalPath(), ...opts });
+    stores.push(s);
+    return s;
+  }
+
   it("loads executing tokens with no reconcile and leaves them queryable as stuck", async () => {
-    const path = journalPath();
-    const store = makeStore({ journalPath: path });
+    const store = journalStore();
     const { planToken } = store.create({ op: "x" }, meta());
     store.beginExecute(planToken, { op: "x" });
 
-    const recovered = await PlanStore.fromJournal<Payload>(path, { planTtlMs: TTL_MS });
+    const recovered = await PlanStore.fromJournal<Payload>(journalPath(), { planTtlMs: TTL_MS });
+    stores.push(recovered);
     const executing = recovered.listExecuting();
     expect(executing).toHaveLength(1);
     expect(executing[0].planToken).toBe(planToken);
@@ -483,36 +510,38 @@ describe("PlanStore.fromJournal recovery", () => {
   });
 
   it("reconcile done -> marks the token executed", async () => {
-    const path = journalPath();
-    const events: AuditEvent[] = [];
-    const store = makeStore({ journalPath: path, audit: collect(events) });
+    const preCrashEvents: AuditEvent[] = [];
+    const store = journalStore({ audit: collect(preCrashEvents) });
     const { planToken } = store.create({ op: "x" }, meta());
     store.beginExecute(planToken, { op: "x" });
 
     const reconcile = vi.fn(async () => "done" as const);
-    const recovered = await PlanStore.fromJournal<Payload>(path, {
+    const recoveryEvents: AuditEvent[] = [];
+    const recovered = await PlanStore.fromJournal<Payload>(journalPath(), {
       planTtlMs: TTL_MS,
-      audit: collect(events),
+      audit: collect(recoveryEvents),
       reconcile,
     });
+    stores.push(recovered);
 
     expect(reconcile).toHaveBeenCalledWith(planToken);
     expect(recovered.listExecuting()).toHaveLength(0);
     // A later replay must not re-reconcile a settled token.
-    expect(await replayJournal<Payload>(path)).toHaveLength(0);
-    expect(events.map((e) => e.status)).toEqual(["previewed", "executing", "executed"]);
+    expect(await replayJournal<Payload>(journalPath())).toHaveLength(0);
+    expect(preCrashEvents.map((e) => e.status)).toEqual(["previewed", "executing"]);
+    expect(recoveryEvents.map((e) => e.status)).toEqual(["executed"]);
   });
 
   it("reconcile not-done -> allows retry", async () => {
-    const path = journalPath();
-    const store = makeStore({ journalPath: path });
+    const store = journalStore();
     const { planToken } = store.create({ op: "x" }, meta());
     store.beginExecute(planToken, { op: "x" });
 
-    const recovered = await PlanStore.fromJournal<Payload>(path, {
+    const recovered = await PlanStore.fromJournal<Payload>(journalPath(), {
       planTtlMs: TTL_MS,
       reconcile: async () => "not-done",
     });
+    stores.push(recovered);
     expect(recovered.listExecuting()).toHaveLength(0);
 
     const retry = recovered.beginExecute(planToken, { op: "x" });
@@ -521,36 +550,38 @@ describe("PlanStore.fromJournal recovery", () => {
   });
 
   it("reconcile unknown -> leaves the token executing and does not guess", async () => {
-    const path = journalPath();
-    const events: AuditEvent[] = [];
-    const store = makeStore({ journalPath: path, audit: collect(events) });
+    const preCrashEvents: AuditEvent[] = [];
+    const store = journalStore({ audit: collect(preCrashEvents) });
     const { planToken } = store.create({ op: "x" }, meta());
     store.beginExecute(planToken, { op: "x" });
 
-    const recovered = await PlanStore.fromJournal<Payload>(path, {
+    const recoveryEvents: AuditEvent[] = [];
+    const recovered = await PlanStore.fromJournal<Payload>(journalPath(), {
       planTtlMs: TTL_MS,
-      audit: collect(events),
+      audit: collect(recoveryEvents),
       reconcile: async () => "unknown",
     });
+    stores.push(recovered);
     expect(recovered.listExecuting()).toHaveLength(1);
     // No executed/failed guess was emitted.
-    expect(events.map((e) => e.status)).toEqual(["previewed", "executing"]);
+    expect(preCrashEvents.map((e) => e.status)).toEqual(["previewed", "executing"]);
+    expect(recoveryEvents).toHaveLength(0);
   });
 
   it("a throwing reconcile callback is treated as unknown, never a guess", async () => {
-    const path = journalPath();
-    const store = makeStore({ journalPath: path });
+    const store = journalStore();
     const { planToken } = store.create({ op: "x" }, meta());
     store.beginExecute(planToken, { op: "x" });
 
     const spy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     try {
-      const recovered = await PlanStore.fromJournal<Payload>(path, {
+      const recovered = await PlanStore.fromJournal<Payload>(journalPath(), {
         planTtlMs: TTL_MS,
         reconcile: async () => {
           throw new Error("downstream api down");
         },
       });
+      stores.push(recovered);
       expect(recovered.listExecuting()).toHaveLength(1);
       expect(spy).toHaveBeenCalled();
     } finally {
@@ -559,18 +590,18 @@ describe("PlanStore.fromJournal recovery", () => {
   });
 
   it("reconcileStuck settles a single stuck token without restarting", async () => {
-    const path = journalPath();
-    const store = makeStore({ journalPath: path });
+    const store = journalStore();
     const { planToken } = store.create({ op: "x" }, meta());
     store.beginExecute(planToken, { op: "x" });
 
     const reconcile = vi.fn()
       .mockResolvedValueOnce("unknown")
       .mockResolvedValueOnce("not-done");
-    const recovered = await PlanStore.fromJournal<Payload>(path, {
+    const recovered = await PlanStore.fromJournal<Payload>(journalPath(), {
       planTtlMs: TTL_MS,
       reconcile,
     });
+    stores.push(recovered);
     expect(recovered.listExecuting()).toHaveLength(1);
 
     const settled = await recovered.reconcileStuck(planToken);
@@ -579,12 +610,12 @@ describe("PlanStore.fromJournal recovery", () => {
   });
 
   it("reconcileStuck reports NO_RECONCILE when no callback is configured", async () => {
-    const path = journalPath();
-    const store = makeStore({ journalPath: path });
+    const store = journalStore();
     const { planToken } = store.create({ op: "x" }, meta());
     store.beginExecute(planToken, { op: "x" });
 
-    const recovered = await PlanStore.fromJournal<Payload>(path, { planTtlMs: TTL_MS });
+    const recovered = await PlanStore.fromJournal<Payload>(journalPath(), { planTtlMs: TTL_MS });
+    stores.push(recovered);
     const result = await recovered.reconcileStuck(planToken);
     expect(result.ok).toBe(false);
     if (!result.ok) {
