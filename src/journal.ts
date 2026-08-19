@@ -1,5 +1,6 @@
 import { closeSync, createReadStream, fchmodSync, fsyncSync, openSync, writeSync } from "node:fs";
 import { createInterface } from "node:readline";
+import { dirname } from "node:path";
 
 import type { PlanMeta } from "./planStore.js";
 
@@ -103,6 +104,24 @@ export class AppendOnlyJournal {
     } catch {
       // Creation already used 0o600; leaving a pre-existing broader mode is
       // the host's responsibility — don't fail the open over it.
+    }
+    // fsyncSync(this.fd) durably persists the file's *contents* but not the
+    // directory entry that names it: on POSIX, a fresh file's name can be
+    // lost from its parent directory across a power loss even though the
+    // file's own data was fsync'd, which would make a brand-new journal
+    // invisible to a later PlanStore.fromJournal(). Fsync the parent
+    // directory too — best-effort, like every other journal durability step,
+    // since some platforms (notably Windows) don't support opening a
+    // directory for fsync.
+    try {
+      const dirFd = openSync(dirname(path), "r");
+      try {
+        fsyncSync(dirFd);
+      } finally {
+        closeSync(dirFd);
+      }
+    } catch (err) {
+      process.stderr.write(`journal: could not fsync parent directory of ${path}: ${String(err)}\n`);
     }
   }
 
