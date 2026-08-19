@@ -81,7 +81,9 @@ export interface RecoveredExecuting<TPayload = unknown> {
  *
  * A failed write leaves the descriptor in an unknown position, so the journal
  * is marked unusable after one: subsequent `append()` calls throw instead of
- * silently appending to a corrupt file.
+ * silently appending to a corrupt file. A payload serialization failure (e.g.
+ * a stateful `toJSON()`) is treated the same way — the transition must never
+ * vanish silently — so the journal is broken rather than skipped.
  */
 export class AppendOnlyJournal {
   private readonly fd: number;
@@ -113,6 +115,13 @@ export class AppendOnlyJournal {
     try {
       line = JSON.stringify(record);
     } catch (err) {
+      // A payload's toJSON() can serialize fine at create() time (during
+      // fingerprinting) and then throw here, on the journal-time call. If the
+      // transition were silently dropped, beginExecute() could report success
+      // with no durable `executing` record — a crash before confirmExecuted()
+      // would be unrecoverable. Treat it like a write failure: break the
+      // journal so subsequent append() calls throw loudly.
+      this.broken = true;
       process.stderr.write(`journal: could not serialize record for ${record.planToken}: ${String(err)}\n`);
       return;
     }

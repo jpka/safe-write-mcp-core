@@ -29,6 +29,7 @@ function makeStore<T = Payload>(
     planTtlMs: number;
     journalPath: string;
     audit: AuditSink;
+    reconcileTimeoutMs: number;
     reconcile: (t: string) => ReconcileOutcome | Promise<ReconcileOutcome>;
   }> = {},
 ): PlanStore<T> {
@@ -586,6 +587,35 @@ describe("PlanStore.fromJournal recovery", () => {
       expect(spy).toHaveBeenCalled();
     } finally {
       spy.mockRestore();
+    }
+  });
+
+  it("a reconcile callback that never resolves within reconcileTimeoutMs is treated as unknown", async () => {
+    vi.useFakeTimers();
+    try {
+      const recoveryEvents: AuditEvent[] = [];
+      const store = journalStore({
+        reconcile: () => new Promise<ReconcileOutcome>(() => {}),
+        reconcileTimeoutMs: 500,
+        audit: collect(recoveryEvents),
+      });
+      const { planToken } = store.create({ op: "x" }, meta());
+      store.beginExecute(planToken, { op: "x" });
+
+      const pending = store.reconcileStuck(planToken);
+      await vi.advanceTimersByTimeAsync(1_000);
+      const result = await pending;
+
+      expect(result.ok).toBe(true);
+      // The token was never settled: it stays executing and queryable.
+      expect(store.listExecuting()).toHaveLength(1);
+      expect(store.listExecuting()[0].planToken).toBe(planToken);
+      // No terminal executed/failed event was guessed for it.
+      const statuses = recoveryEvents.map((e) => e.status);
+      expect(statuses).not.toContain("executed");
+      expect(statuses).not.toContain("failed");
+    } finally {
+      vi.useRealTimers();
     }
   });
 

@@ -164,6 +164,12 @@ export interface PlanStoreOptions {
    * becomes observable. A restarted host replays it via
    * `PlanStore.fromJournal` to recover tokens that were mid-execution. When
    * omitted, no journal is written and the library works with zero config.
+   *
+   * The journal is cleartext JSONL: each line carries the full `payload`,
+   * `reason`, `callerId`, and `dataDigest`, so it is sensitive/PII-bearing
+   * data at rest. New files are created at `0o600`; hosts that need storage
+   * encryption, or a retention/rotation policy stronger than `0o600`, must
+   * provide it themselves — the core does neither.
    */
   journalPath?: string;
   /**
