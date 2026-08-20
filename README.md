@@ -2,7 +2,7 @@
 
 Two-phase write core for MCP servers: preview-then-execute plan tokens, out-of-band localhost approval, and audit hooks. Zero runtime dependencies, transport-agnostic — hosts supply `preview()`/`execute()` callbacks and an audit persistence implementation.
 
-**Status:** core complete (plan store, approval server, audit). Version 0.1.0, published.
+**Status:** core complete (plan store, approval server, audit). Version 0.3.0, published.
 
 ---
 
@@ -137,6 +137,7 @@ Hosts extend the vocabulary with their own domain codes (sw-postgres-mcp's `ROWS
 - Binds to `127.0.0.1` only, never `0.0.0.0` (port `0` = OS-assigned, used by tests).
 - `Host` header must name a loopback host (`127.0.0.1`, `localhost`, `[::1]`) **and** carry the actual bound port; `Origin` and `Sec-Fetch-Site`, when present, must match — this is the DNS-rebinding / CSRF defense.
 - `POST /api/plans/<token>/approve|reject` requires `Content-Type: application/json`, caps bodies at 64 KiB (`413 PAYLOAD_TOO_LARGE`), and never leaks internal error text to clients.
+- `GET /api/plans` returns each plan's metadata plus the host-redacted `render` view. The raw `payload` is **omitted by default** so a `renderPlan` that deliberately keeps fields off the approval surface isn't silently bypassed by the JSON route; set `ApprovalServerOptions.exposeRawPayload: true` to opt back into the unredacted payload. **Breaking in 0.3.0** — consumers reading `plans[].payload` must set the flag.
 - Responses are `Cache-Control: no-store`; errors are structured `{ ok, code, message, hint }` with `hint` optional (omitted by `FORBIDDEN`, `UNSUPPORTED_MEDIA_TYPE`, `PAYLOAD_TOO_LARGE`, `NOT_FOUND`, and `INTERNAL_ERROR`).
 
 ## Development

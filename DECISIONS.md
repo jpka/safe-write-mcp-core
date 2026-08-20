@@ -4,7 +4,7 @@ Each entry records a single architectural decision: the question, what the optio
 
 ---
 
-## 2026-08-20 — Raw payload no longer included by default in `GET /api/plans` response
+## 2026-08-20 — Raw payload no longer included by default in `GET /api/plans` response (0.3.0)
 
 **Question:** `planToJson()` emitted both a `render` field (the host's deliberately-redacted view via `renderPlan`) and a raw `payload` field on the same response. A host that carefully implemented `renderPlan` to keep sensitive fields off the approval surface still had those fields served by the JSON API — silently bypassing the redaction. How do we enforce the redaction contract?
 
