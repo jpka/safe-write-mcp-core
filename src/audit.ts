@@ -7,6 +7,7 @@ export type AuditStatus =
   | "previewed"
   | "awaiting_approval"
   | "approved"
+  | "executing"
   | "executed"
   | "rejected"
   | "refused"

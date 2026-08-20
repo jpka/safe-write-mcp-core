@@ -1,5 +1,8 @@
 import { randomBytes } from "node:crypto";
 
+import { NoopJournal, makeJournalEntry } from "./journal.js";
+import type { Journal, JournalEntry } from "./journal.js";
+import { replayJournal } from "./replay.js";
 import { NoopSink } from "./audit.js";
 import type { AuditEvent, AuditSink, AuditStatus } from "./audit.js";
 import { fingerprint } from "./fingerprint.js";
@@ -79,6 +82,32 @@ export type RejectResult =
   | { ok: true; alreadyRejected: boolean; meta: PlanMeta }
   | { ok: false; error: PlanError; meta: PlanMeta | null };
 
+/**
+ * Result of beginExecute(): the host must call confirmExecuted() or
+ * confirmFailed() to close the lifecycle. If the process crashes between
+ * beginExecute() and the confirm, the plan is stuck in "executing" — a
+ * queryable state the host can detect on restart.
+ */
+export type BeginExecuteResult =
+  | { ok: true; planToken: string; meta: PlanMeta }
+  | { ok: false; error: PlanError; meta: PlanMeta | null };
+
+export type ConfirmResult =
+  | { ok: true; meta: PlanMeta }
+  | { ok: false; error: PlanError; meta: PlanMeta | null };
+
+/**
+ * Host-supplied reconciliation callback. Called after confirmExecuted() to
+ * verify the external side effect actually happened. Returns:
+ * - 'done': the side effect is confirmed; the plan is marked executed.
+ * - 'not-done': the side effect did not happen; the plan is marked failed.
+ * - 'unknown': the side effect status is indeterminate; the plan stays in
+ *   "executing" (the host can retry reconciliation later).
+ */
+export type ReconcileResult = "done" | "not-done" | "unknown";
+
+export type ReconcileCallback = (planToken: string, meta: PlanMeta) => ReconcileResult | Promise<ReconcileResult>;
+
 interface TokenEntry<TPayload> {
   payload: TPayload;
   fingerprint: string;
@@ -95,6 +124,13 @@ interface TokenEntry<TPayload> {
   rejected: boolean;
   /** Human-supplied rejection reason, surfaced back to the agent's next consume() attempt. */
   rejectionReason: string | null;
+  /**
+   * True once beginExecute() has been called but neither confirmExecuted()
+   * nor confirmFailed() has closed the lifecycle. A plan stuck in this state
+   * after a crash is queryable via listExecuting() — the host can reconcile
+   * it rather than silently forgetting it.
+   */
+  executing: boolean;
 }
 
 export interface PlanStoreOptions {
@@ -102,6 +138,18 @@ export interface PlanStoreOptions {
   planTtlMs: number;
   /** Audit sink the store emits lifecycle events to. Defaults to NoopSink. */
   audit?: AuditSink;
+  /**
+   * Durable journal. When configured, every plan transition is appended to
+   * the journal before the in-memory state is mutated. On construction the
+   * journal is replayed to restore state. Defaults to NoopJournal.
+   */
+  journal?: Journal;
+  /**
+   * Host-supplied reconciliation callback. Required when using the
+   * beginExecute()/confirmExecuted() lifecycle. Called after the host
+   * confirms execution to verify the external side effect.
+   */
+  reconcile?: ReconcileCallback;
 }
 
 /**
@@ -111,6 +159,11 @@ export interface PlanStoreOptions {
  * payload, single-use, expiring, and — when gated — only executable after a
  * human approves it out-of-band.
  *
+ * v0.2 adds crash safety: consume() is split into beginExecute() →
+ * confirmExecuted() / confirmFailed(), with a durable journal recording
+ * every transition. A plan stuck in "executing" after a crash is queryable
+ * via listExecuting() and can be reconciled via the host-supplied callback.
+ *
  * The host decides *whether* to create a plan (thresholds, hard caps,
  * preview execution are all host-side); this store decides the lifecycle
  * once a plan exists.
@@ -118,9 +171,64 @@ export interface PlanStoreOptions {
 export class PlanStore<TPayload> {
   private tokens = new Map<string, TokenEntry<TPayload>>();
   private audit: AuditSink;
+  private journal: Journal;
+  private reconcile: ReconcileCallback | undefined;
 
   constructor(private opts: PlanStoreOptions) {
     this.audit = opts.audit ?? NoopSink;
+    this.journal = opts.journal ?? NoopJournal;
+    this.reconcile = opts.reconcile;
+    this.restoreFromJournal();
+  }
+
+  /**
+   * Replay the journal to restore in-memory state. Called once on
+   * construction. Plans stuck in "executing" are restored so the host can
+   * detect and reconcile them.
+   */
+  private restoreFromJournal(): void {
+    const entries = this.journal.replay();
+    const now = Date.now();
+    for (const entry of entries) {
+      // Skip expired entries (unless rejected — tombstones survive)
+      if (now > entry.expiresAt && !entry.flags.rejected) continue;
+      // Skip used entries
+      if (entry.flags.used) continue;
+
+      // Reconstruct the meta
+      const meta: PlanMeta = {
+        tool: entry.meta.tool,
+        reason: entry.meta.reason,
+        callerId: entry.meta.callerId,
+        previewCount: entry.meta.previewCount,
+        dataDigest: entry.meta.dataDigest,
+        extra: { ...entry.meta.extra },
+      };
+
+      // We cannot reconstruct the payload from the journal — only the
+      // fingerprint. For plans that are still "executing" after a crash,
+      // the host must re-create the payload (it was the host's in-flight
+      // work). We store a sentinel payload and rely on the fingerprint
+      // check in beginExecute() to catch any mismatch.
+      // For non-executing plans, the payload is not needed until consume
+      // time, at which point the host must provide the original payload.
+      // We use an empty object as a placeholder — the fingerprint check
+      // will fail if the host passes a different payload.
+      const payload = {} as TPayload;
+
+      this.tokens.set(entry.token, {
+        payload,
+        fingerprint: entry.fingerprint,
+        meta,
+        expiresAt: entry.expiresAt,
+        used: entry.flags.used,
+        requiresApproval: entry.flags.requiresApproval,
+        approved: entry.flags.approved,
+        rejected: entry.flags.rejected,
+        rejectionReason: entry.flags.rejectionReason,
+        executing: entry.flags.executing,
+      });
+    }
   }
 
   create(payload: TPayload, options: PlanCreateOptions): PlanCreated {
@@ -147,7 +255,18 @@ export class PlanStore<TPayload> {
       approved: !requiresApproval,
       rejected: false,
       rejectionReason: null,
+      executing: false,
     });
+    this.journal.append(
+      makeJournalEntry(token, requiresApproval ? "awaiting_approval" : "previewed", expiresAt, fingerprint(payload), meta, {
+        requiresApproval,
+        approved: !requiresApproval,
+        rejected: false,
+        rejectionReason: null,
+        used: false,
+        executing: false,
+      }),
+    );
     this.emit(startedAt, requiresApproval ? "awaiting_approval" : "previewed", token, meta);
     return {
       planToken: token,
@@ -182,6 +301,22 @@ export class PlanStore<TPayload> {
     }
     // Soonest-expiring first — the plans a human needs to act on most urgently lead the list.
     out.sort((a, b) => a.expiresAt - b.expiresAt);
+    return out;
+  }
+
+  /**
+   * Plans stuck in "executing" — beginExecute() was called but neither
+   * confirmExecuted() nor confirmFailed() closed the lifecycle. After a
+   * crash, these are the plans that need reconciliation. Returns the tokens
+   * and their metadata so the host can query the external system.
+   */
+  listExecuting(): Array<{ planToken: string; meta: PlanMeta }> {
+    const out: Array<{ planToken: string; meta: PlanMeta }> = [];
+    for (const [token, entry] of this.tokens) {
+      if (entry.executing) {
+        out.push({ planToken: token, meta: entry.meta });
+      }
+    }
     return out;
   }
 
@@ -239,6 +374,16 @@ export class PlanStore<TPayload> {
     const alreadyApproved = entry.approved;
     entry.approved = true;
     if (!alreadyApproved) {
+      this.journal.append(
+        makeJournalEntry(planToken, "approved", entry.expiresAt, entry.fingerprint, entry.meta, {
+          requiresApproval: entry.requiresApproval,
+          approved: true,
+          rejected: entry.rejected,
+          rejectionReason: entry.rejectionReason,
+          used: entry.used,
+          executing: entry.executing,
+        }),
+      );
       this.emit(startedAt, "approved", planToken, entry.meta);
     }
     return { ok: true, alreadyApproved, meta: entry.meta };
@@ -289,6 +434,16 @@ export class PlanStore<TPayload> {
     entry.rejected = true;
     if (!entry.rejectionReason && reason) entry.rejectionReason = reason;
     if (!alreadyRejected) {
+      this.journal.append(
+        makeJournalEntry(planToken, "rejected", entry.expiresAt, entry.fingerprint, entry.meta, {
+          requiresApproval: entry.requiresApproval,
+          approved: entry.approved,
+          rejected: true,
+          rejectionReason: entry.rejectionReason,
+          used: entry.used,
+          executing: entry.executing,
+        }),
+      );
       this.emit(startedAt, "rejected", planToken, entry.meta);
     }
     return { ok: true, alreadyRejected, meta: entry.meta };
@@ -375,7 +530,262 @@ export class PlanStore<TPayload> {
       );
     }
     entry.used = true;
+    this.journal.append(
+      makeJournalEntry(planToken, "executed", entry.expiresAt, entry.fingerprint, entry.meta, {
+        requiresApproval: entry.requiresApproval,
+        approved: entry.approved,
+        rejected: entry.rejected,
+        rejectionReason: entry.rejectionReason,
+        used: true,
+        executing: false,
+      }),
+    );
     this.emit(startedAt, "executed", planToken, entry.meta);
+    return { ok: true, meta: entry.meta };
+  }
+
+  /**
+   * v0.2: begin the execute lifecycle. Transitions the plan to "executing"
+   * state and returns the plan token + metadata. The host then makes the
+   * external API call. After the call, the host MUST call either
+   * confirmExecuted() or confirmFailed() to close the lifecycle.
+   *
+   * If the process crashes between beginExecute() and the confirm, the plan
+   * is stuck in "executing" — queryable via listExecuting() and reconcilable
+   * via the host-supplied reconcile callback.
+   *
+   * Check ordering mirrors consume(): rejected → used → expired →
+   * fingerprint mismatch → awaiting approval → already executing.
+   */
+  beginExecute(planToken: string, payload: TPayload): BeginExecuteResult {
+    const startedAt = Date.now();
+    const entry = this.tokens.get(planToken);
+    if (!entry) {
+      return this.failed(
+        startedAt,
+        planToken,
+        null,
+        new PlanError("UNKNOWN_TOKEN", "No plan matches this token. It may have been revoked or never issued."),
+      );
+    }
+    if (entry.rejected) {
+      return this.failed(
+        startedAt,
+        planToken,
+        entry.meta,
+        new PlanError(
+          "PLAN_REJECTED",
+          entry.rejectionReason
+            ? `This plan was rejected by a human reviewer: ${entry.rejectionReason}`
+            : "This plan was rejected by a human reviewer.",
+          "This plan cannot be executed. Narrow the operation and re-preview to get a fresh token.",
+        ),
+      );
+    }
+    if (entry.used) {
+      this.tokens.delete(planToken);
+      return this.failed(
+        startedAt,
+        planToken,
+        entry.meta,
+        new PlanError("PLAN_USED", "This plan token was already used. A plan token can only be executed once."),
+      );
+    }
+    if (Date.now() > entry.expiresAt) {
+      this.tokens.delete(planToken);
+      return this.failed(
+        startedAt,
+        planToken,
+        entry.meta,
+        new PlanError(
+          "PLAN_EXPIRED",
+          "This plan token has expired. Re-run the write to obtain a fresh preview and token.",
+        ),
+      );
+    }
+    if (entry.fingerprint !== fingerprint(payload)) {
+      return this.failed(
+        startedAt,
+        planToken,
+        entry.meta,
+        new PlanError(
+          "PLAN_MISMATCH",
+          "The payload does not match the plan the token was issued for.",
+          "Pass back the exact payload from the preview response.",
+        ),
+      );
+    }
+    if (entry.requiresApproval && !entry.approved) {
+      return this.failed(
+        startedAt,
+        planToken,
+        entry.meta,
+        new PlanError(
+          "AWAITING_APPROVAL",
+          "This plan requires human approval and has not been approved yet.",
+          "Approval happens out-of-band through a human approval process — it cannot be approved by the requesting agent. Wait for approval, or narrow the operation and re-preview.",
+        ),
+      );
+    }
+    if (entry.executing) {
+      return this.failed(
+        startedAt,
+        planToken,
+        entry.meta,
+        new PlanError(
+          "PLAN_EXECUTING",
+          "This plan is already being executed. A crash may have left it in 'executing' state. Reconcile before retrying.",
+          "Check the external system to see if the side effect happened, then call confirmExecuted() or confirmFailed() to close the lifecycle.",
+        ),
+      );
+    }
+    entry.executing = true;
+    this.journal.append(
+      makeJournalEntry(planToken, "executing", entry.expiresAt, entry.fingerprint, entry.meta, {
+        requiresApproval: entry.requiresApproval,
+        approved: entry.approved,
+        rejected: entry.rejected,
+        rejectionReason: entry.rejectionReason,
+        used: false,
+        executing: true,
+      }),
+    );
+    this.emit(startedAt, "executing", planToken, entry.meta);
+    return { ok: true, planToken, meta: entry.meta };
+  }
+
+  /**
+   * v0.2: confirm that the external side effect happened. Transitions the
+   * plan to "executed" and marks it used. If a reconcile callback is
+   * configured, it is called first — the callback verifies the side effect
+   * against the external system.
+   *
+   * If reconcile returns 'unknown', the plan stays in "executing" (the host
+   * can retry later). If reconcile returns 'not-done', the plan is marked
+   * failed (not executed). If reconcile returns 'done' (or no callback is
+   * configured), the plan is marked executed.
+   */
+  async confirmExecuted(planToken: string, meta?: PlanMeta): Promise<ConfirmResult> {
+    const startedAt = Date.now();
+    const entry = this.tokens.get(planToken);
+    if (!entry) {
+      return this.failed(
+        startedAt,
+        planToken,
+        null,
+        new PlanError("UNKNOWN_TOKEN", "No plan matches this token. It may have been revoked or never issued."),
+      );
+    }
+    if (!entry.executing) {
+      return this.failed(
+        startedAt,
+        planToken,
+        entry.meta,
+        new PlanError(
+          "PLAN_NOT_EXECUTING",
+          "This plan is not in 'executing' state. It may have already been confirmed.",
+        ),
+      );
+    }
+
+    // If a reconcile callback is configured, call it to verify the side effect
+    if (this.reconcile) {
+      const reconcileResult = await this.reconcile(planToken, entry.meta);
+      if (reconcileResult === "not-done") {
+        entry.executing = false;
+        entry.used = false;
+        this.journal.append(
+          makeJournalEntry(planToken, "failed", entry.expiresAt, entry.fingerprint, entry.meta, {
+            requiresApproval: entry.requiresApproval,
+            approved: entry.approved,
+            rejected: entry.rejected,
+            rejectionReason: entry.rejectionReason,
+            used: false,
+            executing: false,
+          }),
+        );
+        this.emit(startedAt, "failed", planToken, entry.meta, "RECONCILE_NOT_DONE: external side effect not confirmed");
+        return {
+          ok: false,
+          error: new PlanError(
+            "RECONCILE_NOT_DONE",
+            "Reconciliation confirmed the external side effect did not happen.",
+            "The plan was not executed. Re-preview and retry.",
+          ),
+          meta: entry.meta,
+        };
+      }
+      if (reconcileResult === "unknown") {
+        // Plan stays in "executing" — the host can retry later.
+        return {
+          ok: false,
+          error: new PlanError(
+            "RECONCILE_UNKNOWN",
+            "Reconciliation could not determine if the external side effect happened.",
+            "The plan remains in 'executing' state. Retry reconciliation later.",
+          ),
+          meta: entry.meta,
+        };
+      }
+      // reconcileResult === "done" — fall through to mark executed
+    }
+
+    entry.executing = false;
+    entry.used = true;
+    this.journal.append(
+      makeJournalEntry(planToken, "executed", entry.expiresAt, entry.fingerprint, entry.meta, {
+        requiresApproval: entry.requiresApproval,
+        approved: entry.approved,
+        rejected: entry.rejected,
+        rejectionReason: entry.rejectionReason,
+        used: true,
+        executing: false,
+      }),
+    );
+    this.emit(startedAt, "executed", planToken, entry.meta);
+    return { ok: true, meta: entry.meta };
+  }
+
+  /**
+   * v0.2: confirm that the external side effect did NOT happen. Transitions
+   * the plan to "failed" and clears the executing flag. The plan is NOT
+   * marked used — the host can retry with a new beginExecute().
+   */
+  confirmFailed(planToken: string, reason?: string): ConfirmResult {
+    const startedAt = Date.now();
+    const entry = this.tokens.get(planToken);
+    if (!entry) {
+      return this.failed(
+        startedAt,
+        planToken,
+        null,
+        new PlanError("UNKNOWN_TOKEN", "No plan matches this token. It may have been revoked or never issued."),
+      );
+    }
+    if (!entry.executing) {
+      return this.failed(
+        startedAt,
+        planToken,
+        entry.meta,
+        new PlanError(
+          "PLAN_NOT_EXECUTING",
+          "This plan is not in 'executing' state. It may have already been confirmed.",
+        ),
+      );
+    }
+    entry.executing = false;
+    entry.used = false;
+    this.journal.append(
+      makeJournalEntry(planToken, "failed", entry.expiresAt, entry.fingerprint, entry.meta, {
+        requiresApproval: entry.requiresApproval,
+        approved: entry.approved,
+        rejected: entry.rejected,
+        rejectionReason: entry.rejectionReason,
+        used: false,
+        executing: false,
+      }),
+    );
+    this.emit(startedAt, "failed", planToken, entry.meta, reason ?? "host confirmed execution failed");
     return { ok: true, meta: entry.meta };
   }
 

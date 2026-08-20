@@ -6,12 +6,16 @@ export { fingerprint } from "./fingerprint.js";
 export { PlanStore } from "./planStore.js";
 export type {
   ApproveResult,
+  BeginExecuteResult,
   ConsumeResult,
+  ConfirmResult,
   PendingPlan,
   PlanCreated,
   PlanCreateOptions,
   PlanMeta,
   PlanStoreOptions,
+  ReconcileCallback,
+  ReconcileResult,
   RejectResult,
 } from "./planStore.js";
 export { createApprovalServer, startApprovalServer } from "./approvalServer.js";
@@ -22,3 +26,8 @@ export type {
   RenderablePlan,
   RenderPlan,
 } from "./approvalServer.js";
+
+// Journal exports
+export { FileJournal, NoopJournal } from "./journal.js";
+export type { Journal, JournalEntry, JournalStatus } from "./journal.js";
+export { replayJournal } from "./replay.js";
