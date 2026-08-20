@@ -70,6 +70,15 @@ export interface ApprovalServerOptions<TPayload> {
   onDecision?: (decision: ApprovalDecision) => void | Promise<void>;
   /** HTML page title. Default "Approval queue". */
   title?: string;
+  /**
+   * When true, `GET /api/plans` includes the raw `payload` field in each plan
+   * object alongside the redacted `render` view. Default `false` — the raw
+   * payload is omitted so a host's `renderPlan` redaction is not silently
+   * bypassed by the JSON route. Set true only if you deliberately want the
+   * unredacted payload on this surface and accept that it shares loopback
+   * provenance with the approval page. See safe-write-mcp-core#18.
+   */
+  exposeRawPayload?: boolean;
 }
 
 export interface ApprovalServerHandle {
@@ -350,7 +359,11 @@ function renderPage<TPayload>(
 </html>`;
 }
 
-function planToJson<TPayload>(plan: PendingPlan<TPayload>, renderPlan: RenderPlan<TPayload>) {
+function planToJson<TPayload>(
+  plan: PendingPlan<TPayload>,
+  renderPlan: RenderPlan<TPayload>,
+  exposeRawPayload: boolean,
+) {
   const rendered = renderPlan(plan);
   return {
     plan_token: plan.planToken,
@@ -359,7 +372,7 @@ function planToJson<TPayload>(plan: PendingPlan<TPayload>, renderPlan: RenderPla
     preview_count: plan.previewCount,
     expires_at: plan.expiresAt,
     caller_id: plan.callerId,
-    payload: plan.payload,
+    ...(exposeRawPayload ? { payload: plan.payload } : {}),
     render: { title: rendered.title ?? plan.tool, details: rendered.details },
   };
 }
@@ -373,7 +386,7 @@ export function createApprovalServer<TPayload>(
   const onDecision = options.onDecision;
 
   return http.createServer((req, res) => {
-    void handleRequest(store, renderPlan, title, onDecision, req, res).catch((err) => {
+    void handleRequest(store, renderPlan, title, onDecision, options.exposeRawPayload ?? false, req, res).catch((err) => {
       // Never leak internal error text to a client — log it server-side and
       // send a stable generic message instead.
       process.stderr.write(`approval server error: ${String(err)}\n`);
@@ -391,6 +404,7 @@ async function handleRequest<TPayload>(
   renderPlan: RenderPlan<TPayload>,
   title: string,
   onDecision: ApprovalServerOptions<TPayload>["onDecision"],
+  exposeRawPayload: boolean,
   req: http.IncomingMessage,
   res: http.ServerResponse,
 ): Promise<void> {
@@ -413,7 +427,8 @@ async function handleRequest<TPayload>(
   }
 
   if (method === "GET" && path === "/api/plans") {
-    sendJson(res, 200, { plans: store.listPending().map((p) => planToJson(p, renderPlan)) });
+    sendJson(res, 200, { plans: store.listPending().map((p) => planToJson(p, renderPlan, exposeRawPayload)) });
+
     return;
   }
 

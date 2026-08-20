@@ -4,6 +4,16 @@ Each entry records a single architectural decision: the question, what the optio
 
 ---
 
+## 2026-08-20 — Raw payload no longer included by default in `GET /api/plans` response (0.3.0)
+
+**Question:** `planToJson()` emitted both a `render` field (the host's deliberately-redacted view via `renderPlan`) and a raw `payload` field on the same response. A host that carefully implemented `renderPlan` to keep sensitive fields off the approval surface still had those fields served by the JSON API — silently bypassing the redaction. How do we enforce the redaction contract?
+
+**Decision:** Gate the raw `payload` field behind an explicit opt-in, `ApprovalServerOptions.exposeRawPayload`, defaulting to `false`. `planToJson()` now spreads `payload` conditionally: `...(exposeRawPayload ? { payload: plan.payload } : {})`. Hosts that want full payload visibility must deliberately set `exposeRawPayload: true`; everyone else gets the redacted-only response shape. The HTML approval page is unaffected (it only ever rendered through `renderPlan`).
+
+**Why:** Dropping `payload` entirely (the issue's option 1) is the cleanest end state, but it breaks every existing consumer that reads the payload off this endpoint — including `sw-postgres-mcp` and Shopify servers — without giving them a migration path. The opt-in preserves the escape hatch while making the unsafe direction a deliberate choice: a host must actively decide to expose the raw payload, and the JSDoc on the flag points at the trade-off. The default-false posture matches every other safety decision in this package (fail closed, never silently proceeds). The built-in `defaultRender` already JSON-dumps the payload for hosts that want exactly that display, so opting into `renderPlan` returning full payload is always available without the security footgun.
+
+**Result:** `ApprovalServerOptions.exposeRawPayload?: boolean` added; `planToJson` takes a third `exposeRawPayload: boolean` parameter; `handleRequest` and `createApprovalServer` thread the flag through. Response shape for default consumers: `{ plan_token, tool, reason, preview_count, expires_at, caller_id, render }` — `payload` is absent unless opted in. Regression tests verify payload absence by default, absence when `renderPlan` redacts, and presence only under `exposeRawPayload: true`. Closes #18.
+
 ## 2026-08-19 — Crash-safe execute handoff: `executing` state, durable journal, and a pluggable reconcile hook
 
 **Question:** `consume()` flips `entry.used = true` and emits an `"executed"` audit event in one synchronous step, then returns — while the host performs the actual external side effect somewhere the core cannot see. That audit record is causally disconnected from the real world: a crash between `consume()` and the side effect leaves the log saying "executed" when it didn't happen, and a crash the other way leaves an irreversible side effect (a document sent for signature) already applied while the core still considers the plan unused, so a retry re-executes it. How do we make the executing → executed/failed transition crash-safe and observable?
