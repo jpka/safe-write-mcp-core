@@ -1,6 +1,6 @@
 {
   "name": "safe-write-mcp-core",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Two-phase write core for MCP servers: preview-then-execute plan tokens, out-of-band localhost approval, audit hooks.",
   "license": "MIT",
   "type": "module",
