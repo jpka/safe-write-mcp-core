@@ -76,23 +76,67 @@ describe("approval server", () => {
     expect(info.address).toBe("127.0.0.1");
   });
 
-  it("lists a pending plan on GET /api/plans with payload and rendered fields", async () => {
+  it("lists a pending plan on GET /api/plans with rendered field but NO raw payload", async () => {
     const token = createGatedPlan(store, "reprice", "marking down sale items");
     const resp = await fetch(`${baseUrl}/api/plans`);
     expect(resp.status).toBe(200);
     const { plans } = (await resp.json()) as {
-      plans: Array<Record<string, unknown> & { payload: Payload; render: Record<string, unknown> }>;
+      plans: Array<Record<string, unknown> & { payload?: Payload; render: Record<string, unknown> }>;
     };
     const mine = plans.find((p) => p.plan_token === token);
     expect(mine).toBeDefined();
     expect(mine!.tool).toBe("update_prices");
     expect(mine!.reason).toBe("marking down sale items");
     expect(mine!.preview_count).toBe(1);
-    expect(mine!.payload.op).toBe("reprice");
+    expect(mine!.payload).toBeUndefined();
     expect(mine!.render).toEqual({
       title: "update_prices: reprice",
       details: [{ label: "item 1", value: "10 -> 9" }],
     });
+  });
+
+  it("excludes raw payload from GET /api/plans even when renderPlan surfaces nothing sensitive", async () => {
+    const token = createGatedPlan(store, "secret-op", "testing redaction");
+    const resp = await fetch(`${baseUrl}/api/plans`);
+    expect(resp.status).toBe(200);
+    const { plans } = (await resp.json()) as { plans: Array<Record<string, unknown>> };
+    const mine = plans.find((p) => p.plan_token === token);
+    expect(mine).toBeDefined();
+    expect("payload" in mine!).toBe(false);
+    expect("render" in mine!).toBe(true);
+  });
+
+  it("includes raw payload on GET /api/plans only when exposeRawPayload is true", async () => {
+    const rawStore = makeStore();
+    const rawApproval = await startApprovalServer(rawStore, { renderPlan, exposeRawPayload: true });
+    const rawBaseUrl = `http://${rawApproval.host}:${rawApproval.port}`;
+    try {
+      const token = createGatedPlan(rawStore, "reprice", "raw-payload-opt-in");
+      const resp = await fetch(`${rawBaseUrl}/api/plans`);
+      expect(resp.status).toBe(200);
+      const { plans } = (await resp.json()) as {
+        plans: Array<Record<string, unknown> & { payload: Payload }>;
+      };
+      const mine = plans.find((p) => p.plan_token === token);
+      expect(mine).toBeDefined();
+      expect(mine!.payload).toEqual({ op: "reprice", items: [{ id: 1, before: 10, after: 9 }] });
+      expect(mine!.render).toEqual({
+        title: "update_prices: reprice",
+        details: [{ label: "item 1", value: "10 -> 9" }],
+      });
+      expect(Object.keys(mine!).sort()).toEqual([
+        "caller_id",
+        "expires_at",
+        "payload",
+        "plan_token",
+        "preview_count",
+        "reason",
+        "render",
+        "tool",
+      ]);
+    } finally {
+      await rawApproval.close();
+    }
   });
 
   it("renders the HTML page with the reason, tool, and badge", async () => {
