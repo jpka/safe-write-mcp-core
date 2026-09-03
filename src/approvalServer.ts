@@ -98,6 +98,10 @@ export interface ApprovalServerOptions<TPayload> {
    * carry it. A direct `createApprovalServer` caller that leaves both this
    * and `requireAuth` unset gets a server that requires a token nobody was
    * handed back — pass an explicit token if you need to know it.
+   *
+   * An empty string is treated the same as omitted (a generated token is
+   * used instead) — it isn't a usable secret, and accepting it would let a
+   * `?token=` request with no value at all compare equal and bypass auth.
    */
   authToken?: string;
   /**
@@ -263,7 +267,11 @@ function generateAuthToken(): string {
  */
 function resolveAuthToken<TPayload>(options: ApprovalServerOptions<TPayload>): string | null {
   if (options.requireAuth === false) return null;
-  return options.authToken ?? generateAuthToken();
+  // `||`, not `??`: an empty-string authToken is not a usable secret — a
+  // request whose `?token=` is also empty (no value given at all) would
+  // then compare equal and bypass auth entirely. Fall back to a generated
+  // token for that case exactly like an omitted authToken.
+  return options.authToken || generateAuthToken();
 }
 
 /** Constant-time string comparison — `timingSafeEqual` requires equal-length buffers. */

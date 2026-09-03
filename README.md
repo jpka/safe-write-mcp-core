@@ -150,7 +150,7 @@ Hosts extend the vocabulary with their own domain codes (sw-postgres-mcp's `ROWS
 ```sh
 npm install
 npm run lint   # tsc --noEmit
-npm test       # vitest run (124 tests)
+npm test       # vitest run (125 tests)
 npm run build  # tsc -> dist/ with declarations
 ```
 

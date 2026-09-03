@@ -402,6 +402,27 @@ describe("approval server: caller-supplied authToken", () => {
       await approval.close();
     }
   });
+
+  it("treats an empty-string authToken as omitted rather than as a usable secret", async () => {
+    const store = makeStore();
+    const approval = await startApprovalServer(store, { renderPlan, authToken: "" });
+    const baseUrl = `http://${approval.host}:${approval.port}`;
+    try {
+      // A generated token was used instead of the empty string.
+      expect(approval.token).toBeTruthy();
+      expect(approval.token).not.toBe("");
+
+      // An empty `?token=` (no value given at all) must NOT authenticate.
+      const resp = await fetch(`${baseUrl}/api/plans?token=`);
+      expect(resp.status).toBe(401);
+
+      // The real generated token still works.
+      const authed = await fetch(`${baseUrl}/api/plans?token=${encodeURIComponent(approval.token!)}`);
+      expect(authed.status).toBe(200);
+    } finally {
+      await approval.close();
+    }
+  });
 });
 
 describe("approval server: request-provenance hardening", () => {
