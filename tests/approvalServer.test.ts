@@ -30,6 +30,11 @@ const renderPlan = (plan: PendingPlan<Payload>) => ({
   })),
 });
 
+/** `Authorization` header carrying the server's bearer token, for a normal `fetch()` call. */
+function authHeaders(token: string | null): Record<string, string> {
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
 /**
  * Sends a raw HTTP request with full control over headers — including `Host`,
  * which the Fetch spec forbids scripts from setting and Node's fetch()
@@ -78,7 +83,7 @@ describe("approval server", () => {
 
   it("lists a pending plan on GET /api/plans with rendered field but NO raw payload", async () => {
     const token = createGatedPlan(store, "reprice", "marking down sale items");
-    const resp = await fetch(`${baseUrl}/api/plans`);
+    const resp = await fetch(`${baseUrl}/api/plans`, { headers: authHeaders(approval.token) });
     expect(resp.status).toBe(200);
     const { plans } = (await resp.json()) as {
       plans: Array<Record<string, unknown> & { payload?: Payload; render: Record<string, unknown> }>;
@@ -97,7 +102,7 @@ describe("approval server", () => {
 
   it("excludes raw payload from GET /api/plans even when renderPlan surfaces nothing sensitive", async () => {
     const token = createGatedPlan(store, "secret-op", "testing redaction");
-    const resp = await fetch(`${baseUrl}/api/plans`);
+    const resp = await fetch(`${baseUrl}/api/plans`, { headers: authHeaders(approval.token) });
     expect(resp.status).toBe(200);
     const { plans } = (await resp.json()) as { plans: Array<Record<string, unknown>> };
     const mine = plans.find((p) => p.plan_token === token);
@@ -112,7 +117,7 @@ describe("approval server", () => {
     const rawBaseUrl = `http://${rawApproval.host}:${rawApproval.port}`;
     try {
       const token = createGatedPlan(rawStore, "reprice", "raw-payload-opt-in");
-      const resp = await fetch(`${rawBaseUrl}/api/plans`);
+      const resp = await fetch(`${rawBaseUrl}/api/plans`, { headers: authHeaders(rawApproval.token) });
       expect(resp.status).toBe(200);
       const { plans } = (await resp.json()) as {
         plans: Array<Record<string, unknown> & { payload: Payload }>;
@@ -141,7 +146,7 @@ describe("approval server", () => {
 
   it("renders the HTML page with the reason, tool, and badge", async () => {
     createGatedPlan(store, "reprice", "html-visibility-check");
-    const resp = await fetch(`${baseUrl}/`);
+    const resp = await fetch(`${baseUrl}/`, { headers: authHeaders(approval.token) });
     expect(resp.status).toBe(200);
     expect(resp.headers.get("content-type")).toMatch(/text\/html/);
     const html = await resp.text();
@@ -150,18 +155,26 @@ describe("approval server", () => {
     expect(html).toContain("1 affected");
   });
 
+  it("embeds the bearer token in the HTML page so its own fetch calls authenticate", async () => {
+    const resp = await fetch(`${baseUrl}/`, { headers: authHeaders(approval.token) });
+    const html = await resp.text();
+    expect(html).toContain(`const AUTH_TOKEN = ${JSON.stringify(approval.token)};`);
+  });
+
   it("approve unlocks the plan so consume() succeeds", async () => {
     const token = createGatedPlan(store, "approve-me");
     const resp = await fetch(`${baseUrl}/api/plans/${encodeURIComponent(token)}/approve`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...authHeaders(approval.token) },
       body: JSON.stringify({ approvedBy: "reviewer@example.com" }),
     });
     expect(resp.status).toBe(200);
     expect(((await resp.json()) as { ok: boolean }).ok).toBe(true);
 
     // Approved plan drops off the pending list.
-    const { plans } = (await (await fetch(`${baseUrl}/api/plans`)).json()) as {
+    const { plans } = (await (
+      await fetch(`${baseUrl}/api/plans`, { headers: authHeaders(approval.token) })
+    ).json()) as {
       plans: Array<{ plan_token: string }>;
     };
     expect(plans.find((p) => p.plan_token === token)).toBeUndefined();
@@ -173,7 +186,7 @@ describe("approval server", () => {
   it("approving an unknown token is a structured 404", async () => {
     const resp = await fetch(`${baseUrl}/api/plans/not-a-real-token/approve`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...authHeaders(approval.token) },
       body: "{}",
     });
     expect(resp.status).toBe(404);
@@ -186,7 +199,7 @@ describe("approval server", () => {
     const token = createGatedPlan(store, "reject-me");
     const rejectResp = await fetch(`${baseUrl}/api/plans/${encodeURIComponent(token)}/reject`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...authHeaders(approval.token) },
       body: JSON.stringify({ rejectedBy: "reviewer@example.com", reason: "too broad" }),
     });
     expect(rejectResp.status).toBe(200);
@@ -202,7 +215,7 @@ describe("approval server", () => {
 
     const approveAfter = await fetch(`${baseUrl}/api/plans/${encodeURIComponent(token)}/approve`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...authHeaders(approval.token) },
       body: "{}",
     });
     expect(approveAfter.status).toBe(409);
@@ -215,14 +228,14 @@ describe("approval server", () => {
     const token = createGatedPlan(store, "reject-twice");
     const first = await fetch(`${baseUrl}/api/plans/${encodeURIComponent(token)}/reject`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...authHeaders(approval.token) },
       body: JSON.stringify({ reason: "first reason" }),
     });
     expect(((await first.json()) as { ok: boolean; already_rejected: boolean }).already_rejected).toBe(false);
 
     const second = await fetch(`${baseUrl}/api/plans/${encodeURIComponent(token)}/reject`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...authHeaders(approval.token) },
       body: JSON.stringify({ reason: "second reason" }),
     });
     expect(second.status).toBe(200);
@@ -233,14 +246,16 @@ describe("approval server", () => {
 
   it("an ungated plan never appears on the pending list", async () => {
     const { planToken } = store.create({ op: "below-threshold" }, { tool: "update_prices" });
-    const { plans } = (await (await fetch(`${baseUrl}/api/plans`)).json()) as {
+    const { plans } = (await (
+      await fetch(`${baseUrl}/api/plans`, { headers: authHeaders(approval.token) })
+    ).json()) as {
       plans: Array<{ plan_token: string }>;
     };
     expect(plans.find((p) => p.plan_token === planToken)).toBeUndefined();
   });
 
   it("returns a structured 404 for an unknown route", async () => {
-    const resp = await fetch(`${baseUrl}/nope`);
+    const resp = await fetch(`${baseUrl}/nope`, { headers: authHeaders(approval.token) });
     expect(resp.status).toBe(404);
     const json = (await resp.json()) as { ok: boolean; code: string };
     expect(json.ok).toBe(false);
@@ -250,7 +265,7 @@ describe("approval server", () => {
   it("returns 404, not 500, for a malformed percent-escape in the token segment", async () => {
     const resp = await fetch(`${baseUrl}/api/plans/%E0%A4%A/approve`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...authHeaders(approval.token) },
       body: "{}",
     });
     expect(resp.status).toBe(404);
@@ -260,8 +275,153 @@ describe("approval server", () => {
   });
 
   it("sets Cache-Control: no-store on both JSON and HTML responses", async () => {
-    expect((await fetch(`${baseUrl}/api/plans`)).headers.get("cache-control")).toBe("no-store");
-    expect((await fetch(`${baseUrl}/`)).headers.get("cache-control")).toBe("no-store");
+    expect(
+      (await fetch(`${baseUrl}/api/plans`, { headers: authHeaders(approval.token) })).headers.get("cache-control"),
+    ).toBe("no-store");
+    expect((await fetch(`${baseUrl}/`, { headers: authHeaders(approval.token) })).headers.get("cache-control")).toBe(
+      "no-store",
+    );
+  });
+});
+
+describe("approval server: bearer-token authentication", () => {
+  let store: PlanStore<Payload>;
+  let approval: ApprovalServerHandle;
+  let baseUrl: string;
+
+  beforeAll(async () => {
+    store = makeStore();
+    approval = await startApprovalServer(store, { renderPlan });
+    baseUrl = `http://${approval.host}:${approval.port}`;
+  });
+
+  afterAll(async () => {
+    await approval?.close().catch(() => {});
+  });
+
+  it("generates a token by default and returns it on the handle", () => {
+    expect(typeof approval.token).toBe("string");
+    expect(approval.token!.length).toBeGreaterThanOrEqual(32);
+  });
+
+  it("rejects GET /api/plans with no token at all", async () => {
+    const resp = await fetch(`${baseUrl}/api/plans`);
+    expect(resp.status).toBe(401);
+    expect(((await resp.json()) as { code: string }).code).toBe("UNAUTHORIZED");
+  });
+
+  it("rejects GET /api/plans with a wrong Authorization bearer token", async () => {
+    const resp = await fetch(`${baseUrl}/api/plans`, { headers: { Authorization: "Bearer not-the-token" } });
+    expect(resp.status).toBe(401);
+    expect(((await resp.json()) as { code: string }).code).toBe("UNAUTHORIZED");
+  });
+
+  it("accepts the correct token via the Authorization header", async () => {
+    const resp = await fetch(`${baseUrl}/api/plans`, { headers: { Authorization: `Bearer ${approval.token}` } });
+    expect(resp.status).toBe(200);
+  });
+
+  it("accepts the correct token via a ?token= query-string fallback", async () => {
+    const resp = await fetch(`${baseUrl}/api/plans?token=${encodeURIComponent(approval.token!)}`);
+    expect(resp.status).toBe(200);
+  });
+
+  it("rejects a wrong ?token= query-string value", async () => {
+    const resp = await fetch(`${baseUrl}/api/plans?token=wrong`);
+    expect(resp.status).toBe(401);
+  });
+
+  it("rejects an unauthenticated POST /api/plans/:token/approve — the plan token alone is not enough", async () => {
+    const token = createGatedPlan(store, "unauthenticated-approve-attempt");
+    const resp = await fetch(`${baseUrl}/api/plans/${encodeURIComponent(token)}/approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    expect(resp.status).toBe(401);
+    expect(((await resp.json()) as { code: string }).code).toBe("UNAUTHORIZED");
+
+    // The plan is untouched — a correctly authenticated approve still works.
+    const approved = await fetch(`${baseUrl}/api/plans/${encodeURIComponent(token)}/approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${approval.token}` },
+      body: "{}",
+    });
+    expect(approved.status).toBe(200);
+  });
+
+  it("rejects an unauthenticated GET / (the approval page itself)", async () => {
+    const resp = await fetch(`${baseUrl}/`);
+    expect(resp.status).toBe(401);
+  });
+
+  it("serves GET / when the token is passed as a query string", async () => {
+    const resp = await fetch(`${baseUrl}/?token=${encodeURIComponent(approval.token!)}`);
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get("content-type")).toMatch(/text\/html/);
+  });
+});
+
+describe("approval server: requireAuth: false opt-out", () => {
+  let store: PlanStore<Payload>;
+  let approval: ApprovalServerHandle;
+  let baseUrl: string;
+
+  beforeAll(async () => {
+    store = makeStore();
+    approval = await startApprovalServer(store, { renderPlan, requireAuth: false });
+    baseUrl = `http://${approval.host}:${approval.port}`;
+  });
+
+  afterAll(async () => {
+    await approval?.close().catch(() => {});
+  });
+
+  it("returns null on the handle's token", () => {
+    expect(approval.token).toBeNull();
+  });
+
+  it("serves an unauthenticated request when auth is disabled", async () => {
+    const resp = await fetch(`${baseUrl}/api/plans`);
+    expect(resp.status).toBe(200);
+  });
+});
+
+describe("approval server: caller-supplied authToken", () => {
+  it("accepts a host-supplied authToken instead of generating one", async () => {
+    const store = makeStore();
+    const approval = await startApprovalServer(store, { renderPlan, authToken: "my-own-secret" });
+    const baseUrl = `http://${approval.host}:${approval.port}`;
+    try {
+      expect(approval.token).toBe("my-own-secret");
+      const resp = await fetch(`${baseUrl}/api/plans`, { headers: { Authorization: "Bearer my-own-secret" } });
+      expect(resp.status).toBe(200);
+      const rejected = await fetch(`${baseUrl}/api/plans`, { headers: { Authorization: "Bearer generated" } });
+      expect(rejected.status).toBe(401);
+    } finally {
+      await approval.close();
+    }
+  });
+
+  it("treats an empty-string authToken as omitted rather than as a usable secret", async () => {
+    const store = makeStore();
+    const approval = await startApprovalServer(store, { renderPlan, authToken: "" });
+    const baseUrl = `http://${approval.host}:${approval.port}`;
+    try {
+      // A generated token was used instead of the empty string.
+      expect(approval.token).toBeTruthy();
+      expect(approval.token).not.toBe("");
+
+      // An empty `?token=` (no value given at all) must NOT authenticate.
+      const resp = await fetch(`${baseUrl}/api/plans?token=`);
+      expect(resp.status).toBe(401);
+
+      // The real generated token still works.
+      const authed = await fetch(`${baseUrl}/api/plans?token=${encodeURIComponent(approval.token!)}`);
+      expect(authed.status).toBe(200);
+    } finally {
+      await approval.close();
+    }
   });
 });
 
@@ -283,7 +443,7 @@ describe("approval server: request-provenance hardening", () => {
   it("rejects a Host header that doesn't match the actual bound port", async () => {
     const result = await rawRequest(`${baseUrl}/api/plans`, {
       method: "GET",
-      headers: { Host: "evil.example.com" },
+      headers: { Host: "evil.example.com", Authorization: `Bearer ${approval.token}` },
     });
     expect(result.status).toBe(403);
     expect((JSON.parse(result.body) as { code: string }).code).toBe("FORBIDDEN");
@@ -292,7 +452,7 @@ describe("approval server: request-provenance hardening", () => {
   it("accepts localhost as a Host header name on the bound port", async () => {
     const result = await rawRequest(`${baseUrl}/api/plans`, {
       method: "GET",
-      headers: { Host: `localhost:${approval.port}` },
+      headers: { Host: `localhost:${approval.port}`, Authorization: `Bearer ${approval.token}` },
     });
     expect(result.status).toBe(200);
   });
@@ -300,7 +460,11 @@ describe("approval server: request-provenance hardening", () => {
   it("accepts localhost as a Host name with a matching Origin", async () => {
     const result = await rawRequest(`${baseUrl}/api/plans`, {
       method: "GET",
-      headers: { Host: `localhost:${approval.port}`, Origin: `http://localhost:${approval.port}` },
+      headers: {
+        Host: `localhost:${approval.port}`,
+        Origin: `http://localhost:${approval.port}`,
+        Authorization: `Bearer ${approval.token}`,
+      },
     });
     expect(result.status).toBe(200);
   });
@@ -308,19 +472,31 @@ describe("approval server: request-provenance hardening", () => {
   it("still rejects a loopback Host name on the wrong port", async () => {
     const result = await rawRequest(`${baseUrl}/api/plans`, {
       method: "GET",
-      headers: { Host: "localhost:1" },
+      headers: { Host: "localhost:1", Authorization: `Bearer ${approval.token}` },
+    });
+    expect(result.status).toBe(403);
+  });
+
+  it("checks provenance ahead of auth: a bad Host header is 403 even with no token", async () => {
+    const result = await rawRequest(`${baseUrl}/api/plans`, {
+      method: "GET",
+      headers: { Host: "evil.example.com" },
     });
     expect(result.status).toBe(403);
   });
 
   it("rejects an Origin header that doesn't match this server's origin", async () => {
-    const resp = await fetch(`${baseUrl}/api/plans`, { headers: { Origin: "http://evil.example.com" } });
+    const resp = await fetch(`${baseUrl}/api/plans`, {
+      headers: { Origin: "http://evil.example.com", ...authHeaders(approval.token) },
+    });
     expect(resp.status).toBe(403);
     expect(((await resp.json()) as { code: string }).code).toBe("FORBIDDEN");
   });
 
   it("rejects Sec-Fetch-Site: cross-site", async () => {
-    const resp = await fetch(`${baseUrl}/api/plans`, { headers: { "Sec-Fetch-Site": "cross-site" } });
+    const resp = await fetch(`${baseUrl}/api/plans`, {
+      headers: { "Sec-Fetch-Site": "cross-site", ...authHeaders(approval.token) },
+    });
     expect(resp.status).toBe(403);
     expect(((await resp.json()) as { code: string }).code).toBe("FORBIDDEN");
   });
@@ -329,7 +505,7 @@ describe("approval server: request-provenance hardening", () => {
     const token = createGatedPlan(store, "content-type-check");
     const resp = await fetch(`${baseUrl}/api/plans/${encodeURIComponent(token)}/approve`, {
       method: "POST",
-      headers: { "Content-Type": "text/plain" },
+      headers: { "Content-Type": "text/plain", ...authHeaders(approval.token) },
       body: "{}",
     });
     expect(resp.status).toBe(415);
@@ -340,6 +516,7 @@ describe("approval server: request-provenance hardening", () => {
     const token = createGatedPlan(store, "no-content-type-check");
     const result = await rawRequest(`${baseUrl}/api/plans/${encodeURIComponent(token)}/approve`, {
       method: "POST",
+      headers: { Authorization: `Bearer ${approval.token}` },
       body: "{}",
     });
     expect(result.status).toBe(415);
@@ -351,7 +528,7 @@ describe("approval server: request-provenance hardening", () => {
     const oversized = JSON.stringify({ approvedBy: "x".repeat(70 * 1024) });
     const result = await rawRequest(`${baseUrl}/api/plans/${encodeURIComponent(token)}/approve`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${approval.token}` },
       body: oversized,
     });
     expect(result.status).toBe(413);
@@ -361,13 +538,25 @@ describe("approval server: request-provenance hardening", () => {
   });
 
   it("still serves a legitimate request whose Origin matches the server's own origin", async () => {
-    const resp = await fetch(`${baseUrl}/api/plans`, { headers: { Origin: baseUrl } });
+    const resp = await fetch(`${baseUrl}/api/plans`, { headers: { Origin: baseUrl, ...authHeaders(approval.token) } });
     expect(resp.status).toBe(200);
   });
 
   it("still serves a legitimate request with Sec-Fetch-Site: same-origin or none", async () => {
-    expect((await fetch(`${baseUrl}/api/plans`, { headers: { "Sec-Fetch-Site": "same-origin" } })).status).toBe(200);
-    expect((await fetch(`${baseUrl}/api/plans`, { headers: { "Sec-Fetch-Site": "none" } })).status).toBe(200);
+    expect(
+      (
+        await fetch(`${baseUrl}/api/plans`, {
+          headers: { "Sec-Fetch-Site": "same-origin", ...authHeaders(approval.token) },
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await fetch(`${baseUrl}/api/plans`, {
+          headers: { "Sec-Fetch-Site": "none", ...authHeaders(approval.token) },
+        })
+      ).status,
+    ).toBe(200);
   });
 });
 
@@ -378,21 +567,25 @@ describe("approval server: expiry and onDecision hook", () => {
     const baseUrl = `http://${approval.host}:${approval.port}`;
     try {
       const token = createGatedPlan(store, "expiring");
-      const before = (await (await fetch(`${baseUrl}/api/plans`)).json()) as {
+      const before = (await (
+        await fetch(`${baseUrl}/api/plans`, { headers: authHeaders(approval.token) })
+      ).json()) as {
         plans: Array<{ plan_token: string }>;
       };
       expect(before.plans.find((p) => p.plan_token === token)).toBeDefined();
 
       await new Promise((resolve) => setTimeout(resolve, 60));
 
-      const after = (await (await fetch(`${baseUrl}/api/plans`)).json()) as {
+      const after = (await (
+        await fetch(`${baseUrl}/api/plans`, { headers: authHeaders(approval.token) })
+      ).json()) as {
         plans: Array<{ plan_token: string }>;
       };
       expect(after.plans.find((p) => p.plan_token === token)).toBeUndefined();
 
       const approveResp = await fetch(`${baseUrl}/api/plans/${encodeURIComponent(token)}/approve`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders(approval.token) },
         body: "{}",
       });
       expect(approveResp.status).toBe(410);
@@ -416,14 +609,14 @@ describe("approval server: expiry and onDecision hook", () => {
       const approveToken = createGatedPlan(store, "decision-approve");
       await fetch(`${baseUrl}/api/plans/${encodeURIComponent(approveToken)}/approve`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders(approval.token) },
         body: JSON.stringify({ approvedBy: "alice" }),
       });
 
       const rejectToken = createGatedPlan(store, "decision-reject");
       await fetch(`${baseUrl}/api/plans/${encodeURIComponent(rejectToken)}/reject`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders(approval.token) },
         body: JSON.stringify({ rejectedBy: "bob", reason: "nope" }),
       });
 
@@ -454,7 +647,7 @@ describe("approval server: expiry and onDecision hook", () => {
     try {
       await fetch(`${baseUrl}/api/plans/nope/approve`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders(approval.token) },
         body: "{}",
       });
       expect(decisions).toHaveLength(1);
@@ -471,7 +664,9 @@ describe("approval server: expiry and onDecision hook", () => {
     const baseUrl = `http://${approval.host}:${approval.port}`;
     try {
       const token = createGatedPlan(store, "default-render");
-      const { plans } = (await (await fetch(`${baseUrl}/api/plans`)).json()) as {
+      const { plans } = (await (
+        await fetch(`${baseUrl}/api/plans`, { headers: authHeaders(approval.token) })
+      ).json()) as {
         plans: Array<{ render: { title: string; details: Array<{ label: string }> } }>;
       };
       const mine = plans.find((p) => p.render.title === "update_prices");
