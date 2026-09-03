@@ -2,7 +2,7 @@
 
 Two-phase write core for MCP servers: preview-then-execute plan tokens, out-of-band localhost approval, and audit hooks. Zero runtime dependencies, transport-agnostic — hosts supply `preview()`/`execute()` callbacks and an audit persistence implementation.
 
-**Status:** core complete (plan store, approval server, audit). Version 0.3.0, published.
+**Status:** core complete (plan store, approval server, audit). Version 0.4.0, published.
 
 ---
 
@@ -22,7 +22,7 @@ The core owns the plan lifecycle only. Everything policy-shaped — thresholds, 
 - **Single-use, expiring tokens.** A token executes at most once. It moves through `executing` (between `beginExecute` and `confirmExecuted`) and a token already in flight refuses a second `beginExecute` with `ALREADY_EXECUTING`; a second `beginExecute` after `confirmExecuted` is `PLAN_USED` and the entry is pruned. Tokens expire after `planTtlMs`; `beginExecute()`/`approve()`/`reject()` on an expired token are `PLAN_EXPIRED` (and the entry is pruned). Executing entries are exempt from the expiry sweep so a stuck execution stays queryable.
 - **Crash-safe execute handoff.** Execution is two steps so the audit record is never causally disconnected from the real world: `beginExecute(planToken, payload, currentDataDigest?)` runs the gates and transitions the plan to `executing` (no `executed` event yet); the host performs its external side effect against that token; then `confirmExecuted(planToken)` marks it used and emits `executed` — only here — or `confirmFailed(planToken)` releases it back to retryable. Optionally, `PlanStoreOptions.journalPath` writes every token transition to an append-only, fsync'd JSONL journal; on restart, `PlanStore.fromJournal(path, options)` replays it, reloads tokens that were mid-execute, and settles each one via the pluggable `reconcile` hook (`"done"` → executed, `"not-done"` → retryable, `"unknown"` → left queryable, never guessed). `listExecuting()` surfaces in-flight plans for stuck-execution detection.
 - **Plan token as idempotency key.** `planToken` is the key hosts should use in their own dedup ledger when the downstream API has no idempotency support — so a retried execution after a crash or a `"not-done"` reconcile can never double-apply an irreversible action.
-- **Out-of-band human approval.** Gated plans start `awaiting_approval` and cannot be executed until approved. Approval only happens through the localhost approval server (or a host equivalent) — the core ships no agent-facing approval surface, and hosts must keep `PlanStore.approve()` out of agent-facing handlers and tools. `alwaysRequireApproval` forces the gate on operations that must always be human-approved (e.g. `run_migration`), and is a flag only tool-module code may set — never agent-supplied arguments.
+- **Out-of-band human approval.** Gated plans start `awaiting_approval` and cannot be executed until approved. Approval only happens through the localhost approval server (or a host equivalent) — the core ships no agent-facing approval surface, and hosts must keep `PlanStore.approve()` out of agent-facing handlers and tools. `alwaysRequireApproval` forces the gate on operations that must always be human-approved (e.g. `run_migration`), and is a flag only tool-module code may set — never agent-supplied arguments. The approval server itself requires a per-session bearer token by default (see "Approval server behavior" below) — loopback binding and CSRF headers alone only stop a hostile browser page, not another local process that knows a plan token.
 - **Reject is permanent for the process lifetime.** `reject()` writes a tombstone that outlives expiry and the sweep: a rejected plan reports `PLAN_REJECTED` ahead of every other check, until the process exits. Tombstones are in-memory only (see DECISIONS.md) — a restart loses them and a later `beginExecute()` returns `UNKNOWN_TOKEN`. Rejection reasons are surfaced back to the agent's next `beginExecute()` attempt. Rejecting twice is an idempotent no-op. A plan whose side effect is already in flight cannot be rejected (`ALREADY_EXECUTING`).
 - **Deterministic gate ordering.** `beginExecute()` checks, in order: rejected → used → already-executing → expired → fingerprint mismatch → data-digest mismatch → awaiting approval. Hosts and reviewers can rely on which error wins.
 - **Audit events on every transition the core owns.** `previewed`/`awaiting_approval`/`approved`/`executing`/`executed`/`rejected`/`failed` are emitted to an injectable `AuditSink` (default `NoopSink`) — including every refusal path. The sink contract is synchronous and never-throwing; a misbehaving sink is reported to stderr, never allowed to change a plan result. Host execution errors that happen *after* `beginExecute()` succeeds are outside the core's lifecycle and must be audited by the host through the shared `AuditSink`.
@@ -63,13 +63,17 @@ function previewTool(payload: Payload): { planToken: string; approved: boolean }
 }
 
 // Host startup: human approval surface on the same process/store
-const { port } = await startApprovalServer(store, {
+const { port, token } = await startApprovalServer(store, {
   renderPlan: (plan) => ({
     title: `${plan.tool}: ${plan.payload.items.length} items`,
     details: [{ label: "Preview", value: JSON.stringify(plan.payload) }],
   }),
   onDecision: (decision) => myAudit.record(decision), // host's own persistence
 });
+// A bearer token is required on every route by default (see "Approval server
+// behavior" below) — print it once, alongside the URL, so a human can open
+// the page. The page's own Approve/Reject buttons already carry it.
+console.error(`Approval queue: http://127.0.0.1:${port}/?token=${token}`);
 
 // Tool handler: execute half — runs only after approval (either the plan was
 // not gated, or a human approved it on the localhost page). The planToken is
@@ -135,17 +139,18 @@ Hosts extend the vocabulary with their own domain codes (sw-postgres-mcp's `ROWS
 ### Approval server behavior
 
 - Binds to `127.0.0.1` only, never `0.0.0.0` (port `0` = OS-assigned, used by tests).
-- `Host` header must name a loopback host (`127.0.0.1`, `localhost`, `[::1]`) **and** carry the actual bound port; `Origin` and `Sec-Fetch-Site`, when present, must match — this is the DNS-rebinding / CSRF defense.
+- `Host` header must name a loopback host (`127.0.0.1`, `localhost`, `[::1]`) **and** carry the actual bound port; `Origin` and `Sec-Fetch-Site`, when present, must match — this is the DNS-rebinding / CSRF defense. It stops a malicious *browser page*; it does not stop a plain HTTP client (curl, another local process), which the bearer token below is for.
+- **Every route — including the read-only GET ones — requires a bearer token by default.** `startApprovalServer` generates a random one per call and returns it as `token` on the handle; requests must send it as `Authorization: Bearer <token>` or a `?token=` query-string fallback (used by a human-pasted URL and by the built-in page's own initial load — its Approve/Reject fetch calls then carry the token via the header). A request that fails the Host/Origin/Sec-Fetch-Site checks gets `403` before the token is even checked; one that passes those but has no or the wrong token gets `401 UNAUTHORIZED`. Set `ApprovalServerOptions.requireAuth: false` to opt out (not recommended — see #20) or `authToken` to supply your own value instead of a generated one.
 - `POST /api/plans/<token>/approve|reject` requires `Content-Type: application/json`, caps bodies at 64 KiB (`413 PAYLOAD_TOO_LARGE`), and never leaks internal error text to clients.
 - `GET /api/plans` returns each plan's metadata plus the host-redacted `render` view. The raw `payload` is **omitted by default** so a `renderPlan` that deliberately keeps fields off the approval surface isn't silently bypassed by the JSON route; set `ApprovalServerOptions.exposeRawPayload: true` to opt back into the unredacted payload. **Breaking in 0.3.0** — consumers reading `plans[].payload` must set the flag.
-- Responses are `Cache-Control: no-store`; errors are structured `{ ok, code, message, hint }` with `hint` optional (omitted by `FORBIDDEN`, `UNSUPPORTED_MEDIA_TYPE`, `PAYLOAD_TOO_LARGE`, `NOT_FOUND`, and `INTERNAL_ERROR`).
+- Responses are `Cache-Control: no-store`; errors are structured `{ ok, code, message, hint }` with `hint` optional (omitted by `FORBIDDEN`, `UNAUTHORIZED`, `UNSUPPORTED_MEDIA_TYPE`, `PAYLOAD_TOO_LARGE`, `NOT_FOUND`, and `INTERNAL_ERROR`).
 
 ## Development
 
 ```sh
 npm install
 npm run lint   # tsc --noEmit
-npm test       # vitest run (107 tests)
+npm test       # vitest run (124 tests)
 npm run build  # tsc -> dist/ with declarations
 ```
 

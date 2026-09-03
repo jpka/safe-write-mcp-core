@@ -1,3 +1,4 @@
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 
@@ -79,6 +80,34 @@ export interface ApprovalServerOptions<TPayload> {
    * provenance with the approval page. See safe-write-mcp-core#18.
    */
   exposeRawPayload?: boolean;
+  /**
+   * Bearer token every route requires — including the read-only GET ones —
+   * via `Authorization: Bearer <token>` or a `?token=` query-string
+   * fallback (for a human pasting the URL, and for the built-in page's own
+   * initial load). Defaults to a random 32-byte token generated per call
+   * when omitted and `requireAuth` isn't `false`.
+   *
+   * Loopback binding plus the Host/Origin/Sec-Fetch-Site provenance checks
+   * defend against a browser-driven CSRF page; neither stops a *different
+   * local process* that simply sends the expected headers, since a plan
+   * token alone was previously enough to approve or reject a plan. See
+   * safe-write-mcp-core#20.
+   *
+   * `startApprovalServer` returns the resolved value on the handle so a
+   * host running in-process can render links/fetch calls that already
+   * carry it. A direct `createApprovalServer` caller that leaves both this
+   * and `requireAuth` unset gets a server that requires a token nobody was
+   * handed back — pass an explicit token if you need to know it.
+   */
+  authToken?: string;
+  /**
+   * Set to `false` to disable bearer-token authentication and fall back to
+   * the pre-0.4.0 behaviour (loopback bind + provenance checks only, no
+   * shared secret). Default `true`. Not recommended — see
+   * safe-write-mcp-core#20 — but kept as an explicit opt-out so this isn't
+   * a breaking change hosts can't work around.
+   */
+  requireAuth?: boolean;
 }
 
 export interface ApprovalServerHandle {
@@ -86,6 +115,13 @@ export interface ApprovalServerHandle {
   /** Actual bound port — resolved even when options.port is 0. */
   port: number;
   host: string;
+  /**
+   * The bearer token every route requires, or `null` when `requireAuth` was
+   * set to `false`. Print this alongside the approval URL (e.g.
+   * `http://127.0.0.1:<port>/?token=<token>`) so a human opening it in a
+   * browser authenticates on first load.
+   */
+  token: string | null;
   close(): Promise<void>;
 }
 
@@ -213,6 +249,52 @@ function checkRequestProvenance(req: http.IncomingMessage): string | null {
   return null;
 }
 
+function generateAuthToken(): string {
+  return randomBytes(32).toString("hex");
+}
+
+/**
+ * Resolves the effective bearer token for a set of options: `null` when
+ * `requireAuth` is explicitly `false` (auth disabled), otherwise the
+ * caller-supplied `authToken` or a freshly generated one. Called once per
+ * server so `startApprovalServer` and the `createApprovalServer` it wraps
+ * agree on the same value — `startApprovalServer` resolves it first and
+ * passes the concrete token back down.
+ */
+function resolveAuthToken<TPayload>(options: ApprovalServerOptions<TPayload>): string | null {
+  if (options.requireAuth === false) return null;
+  return options.authToken ?? generateAuthToken();
+}
+
+/** Constant-time string comparison — `timingSafeEqual` requires equal-length buffers. */
+function secureStringsEqual(a: string, b: string): boolean {
+  const bufA = Buffer.from(a, "utf-8");
+  const bufB = Buffer.from(b, "utf-8");
+  return bufA.length === bufB.length && timingSafeEqual(bufA, bufB);
+}
+
+/**
+ * Checks the bearer token against `Authorization: Bearer <token>` first,
+ * then a `?token=` query-string fallback — the latter is what lets the
+ * built-in HTML page's initial `GET /` (a browser navigation, which can't
+ * set custom headers) and a human pasting the printed URL both authenticate.
+ * `token === null` means auth is disabled (`requireAuth: false`).
+ */
+function checkAuthToken(req: http.IncomingMessage, url: URL, token: string | null): string | null {
+  if (token === null) return null;
+
+  const authHeader = req.headers.authorization;
+  if (typeof authHeader === "string") {
+    const match = /^Bearer (.+)$/.exec(authHeader);
+    if (match && secureStringsEqual(match[1]!, token)) return null;
+  }
+
+  const queryToken = url.searchParams.get("token");
+  if (typeof queryToken === "string" && secureStringsEqual(queryToken, token)) return null;
+
+  return "Missing or invalid bearer token";
+}
+
 /** Case-insensitive, ignores a trailing `; charset=...` parameter. */
 function hasJsonContentType(req: http.IncomingMessage): boolean {
   const contentType = req.headers["content-type"];
@@ -274,10 +356,21 @@ function renderPlanCard<TPayload>(plan: PendingPlan<TPayload>, renderPlan: Rende
     </article>`;
 }
 
+/**
+ * Safely embeds a value into an inline `<script>` block as a JS expression:
+ * `JSON.stringify` handles quoting/escaping, and the `</` escape stops the
+ * token (attacker-supplied, when a host sets `authToken` itself) from
+ * closing the surrounding `<script>` tag early.
+ */
+function jsStringLiteral(value: string | null): string {
+  return JSON.stringify(value).replace(/</g, "\\u003c");
+}
+
 function renderPage<TPayload>(
   plans: PendingPlan<TPayload>[],
   renderPlan: RenderPlan<TPayload>,
   title: string,
+  authToken: string | null,
 ): string {
   const cards = plans.length > 0
     ? plans.map((p) => renderPlanCard(p, renderPlan)).join("\n")
@@ -320,6 +413,7 @@ function renderPage<TPayload>(
     ${cards}
   </div>
   <script>
+    const AUTH_TOKEN = ${jsStringLiteral(authToken)};
     document.getElementById("plans").addEventListener("click", async (ev) => {
       const btn = ev.target.closest("button[data-action]");
       if (!btn) return;
@@ -336,9 +430,11 @@ function renderPage<TPayload>(
         const body = action === "approve"
           ? { approvedBy: actor || undefined }
           : { rejectedBy: actor || undefined, reason: reasonText || undefined };
+        const headers = { "Content-Type": "application/json" };
+        if (AUTH_TOKEN) headers["Authorization"] = "Bearer " + AUTH_TOKEN;
         const resp = await fetch("/api/plans/" + tokenUri + "/" + action, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers,
           body: JSON.stringify(body),
         });
         const json = await resp.json();
@@ -384,9 +480,15 @@ export function createApprovalServer<TPayload>(
   const renderPlan = options.renderPlan ?? defaultRender<TPayload>;
   const title = options.title ?? "Approval queue";
   const onDecision = options.onDecision;
+  // Resolved once per server so every request checks against the same
+  // value. `startApprovalServer` pre-resolves this itself (passing a
+  // concrete `authToken` through `options`) so it can hand the token back
+  // on its handle; a direct caller that leaves both `authToken` and
+  // `requireAuth` unset gets a token generated here that nothing surfaces.
+  const authToken = resolveAuthToken(options);
 
   return http.createServer((req, res) => {
-    void handleRequest(store, renderPlan, title, onDecision, options.exposeRawPayload ?? false, req, res).catch((err) => {
+    void handleRequest(store, renderPlan, title, onDecision, options.exposeRawPayload ?? false, authToken, req, res).catch((err) => {
       // Never leak internal error text to a client — log it server-side and
       // send a stable generic message instead.
       process.stderr.write(`approval server error: ${String(err)}\n`);
@@ -405,6 +507,7 @@ async function handleRequest<TPayload>(
   title: string,
   onDecision: ApprovalServerOptions<TPayload>["onDecision"],
   exposeRawPayload: boolean,
+  authToken: string | null,
   req: http.IncomingMessage,
   res: http.ServerResponse,
 ): Promise<void> {
@@ -421,8 +524,21 @@ async function handleRequest<TPayload>(
     return;
   }
 
+  // Applied to every route too, same reasoning as provenance: loopback bind
+  // and the Host/Origin/Sec-Fetch-Site checks above only rule out a
+  // browser-driven cross-origin page. A plain HTTP client on the same host
+  // that never sends Origin/Sec-Fetch-Site (curl, another local process)
+  // sails through those checks with nothing but the plan token — this
+  // bearer check is what actually gates "another local process" out. See
+  // safe-write-mcp-core#20.
+  const authError = checkAuthToken(req, url, authToken);
+  if (authError) {
+    sendJson(res, 401, { ok: false, code: "UNAUTHORIZED", message: authError });
+    return;
+  }
+
   if (method === "GET" && path === "/") {
-    sendHtml(res, 200, renderPage(store.listPending(), renderPlan, title));
+    sendHtml(res, 200, renderPage(store.listPending(), renderPlan, title, authToken));
     return;
   }
 
@@ -559,7 +675,16 @@ export async function startApprovalServer<TPayload>(
   store: PlanStore<TPayload>,
   options: ApprovalServerOptions<TPayload> = {},
 ): Promise<ApprovalServerHandle> {
-  const server = createApprovalServer(store, options);
+  // Resolved here, once, so it can be returned on the handle — then passed
+  // down as a concrete `authToken` so `createApprovalServer`'s own
+  // resolution just echoes it back instead of generating a second,
+  // different token nobody has.
+  const token = resolveAuthToken(options);
+  const server = createApprovalServer(store, {
+    ...options,
+    authToken: token ?? undefined,
+    requireAuth: token !== null,
+  });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(options.port ?? 0, LOOPBACK_HOST, () => {
@@ -572,6 +697,7 @@ export async function startApprovalServer<TPayload>(
     server,
     port: address.port,
     host: LOOPBACK_HOST,
+    token,
     close: () =>
       new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));
